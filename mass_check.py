@@ -5,17 +5,21 @@ import time
 import logging
 import threading
 from telebot import types
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, CancelledError
 from html import escape
 import shutil
 import glob
 import json
-from datetime import datetime
-from shared_state import user_busy
+from datetime import datetime, timezone
+from shared_state import (
+    is_user_busy,
+    set_user_busy,
+    clear_user_busy,
+    save_live_cc_to_json,
+    try_process_with_retries,
+)
 from site_auth_manager import clone_user_site_files
 from config import MAX_WORKERS
-from shared_state import save_live_cc_to_json
-
 # ================================================================
 # ⚙️ CONFIG IMPORTS  (Matches your real config.py)
 # ================================================================
@@ -39,8 +43,21 @@ last_send_time = 0.0
 
 from telebot.apihelper import ApiTelegramException
 
-def safe_send_message(bot, target_id, text, **kwargs):
+_dispatcher = None
+
+
+def set_dispatcher(dispatcher):
+    global _dispatcher
+    _dispatcher = dispatcher
+
+
+def safe_send_message(bot, target_id, text, *, delay: float = 0.0, **kwargs):
     """Send Telegram message safely, respecting flood limits."""
+    if _dispatcher:
+        _dispatcher.enqueue("send_message", target_id, text, delay=delay, **kwargs)
+        return
+    if delay > 0:
+        time.sleep(delay)
     import logging
     while True:
         try:
@@ -100,6 +117,157 @@ outfile_lock = threading.Lock()
 stop_events = {}
 stop_events_lock = threading.Lock()
 activechecks = {}  # {user_id: Thread}
+activechecks_lock = threading.Lock()
+
+WORKER_CARD_PAUSE = 0.35  # seconds delay between cards per worker (tuned for speed)
+LIVE_MESSAGE_GAP_DEFAULT = 1.0   # per-target minimal gap for live notifications (seconds)
+LIVE_MESSAGE_GAP_CHANNEL = 1.2   # slightly higher gap when posting to channel broadcasts
+STOP_CHECK_INTERVAL = 0.2
+
+DECLINED_UPDATE_GAP = 5
+
+_live_send_lock = threading.Lock()
+_live_send_schedule = {}       # target_id -> next allowable send timestamp
+_last_live_scheduled = {}      # target_id -> last scheduled send timestamp
+
+
+def _get_live_gap_for_target(target_id) -> float:
+    """Return the delay gap for a given notification target."""
+    if str(target_id) == str(CHANNEL_ID):
+        return LIVE_MESSAGE_GAP_CHANNEL
+    return LIVE_MESSAGE_GAP_DEFAULT
+
+
+def _cleanup_live_schedule_locked(now: float):
+    """
+    Remove stale scheduling entries; expects _live_send_lock to be held.
+    Keeps dicts small once their scheduled times are far in the past.
+    """
+    expired_targets = [
+        target for target, next_available in list(_live_send_schedule.items())
+        if next_available + 2.0 < now
+    ]
+    for target in expired_targets:
+        _live_send_schedule.pop(target, None)
+        _last_live_scheduled.pop(target, None)
+
+
+def is_mass_check_active(chat_id: str) -> bool:
+    """Return True if the user currently has an active mass-check thread."""
+    with activechecks_lock:
+        thread = activechecks.get(chat_id)
+        return bool(thread and thread.is_alive())
+
+
+def _register_active_thread(chat_id: str, thread: threading.Thread) -> bool:
+    """
+    Track the thread responsible for a user's mass check.
+    Returns False if another live thread exists for the same user.
+    """
+    with activechecks_lock:
+        existing = activechecks.get(chat_id)
+        if existing and existing is not thread and existing.is_alive():
+            return False
+        activechecks[chat_id] = thread
+        return True
+
+
+def _clear_active_thread(chat_id: str, thread: threading.Thread | None = None):
+    """
+    Remove the active thread entry for a user.
+    If `thread` is provided, only clear when it matches the stored one.
+    """
+    with activechecks_lock:
+        if thread is None:
+            activechecks.pop(chat_id, None)
+            return
+        current = activechecks.get(chat_id)
+        if current is thread:
+            activechecks.pop(chat_id, None)
+
+
+def sleep_with_stop(chat_id: str, seconds: float, check_interval: float = STOP_CHECK_INTERVAL) -> bool:
+    """
+    Sleep in small intervals while honoring stop requests.
+    Returns True if a stop was detected during the wait.
+    """
+    if seconds <= 0:
+        return False
+    end_time = time.time() + seconds
+    while True:
+        if is_stop_requested(chat_id):
+            return True
+        remaining = end_time - time.time()
+        if remaining <= 0:
+            return False
+        time.sleep(min(check_interval, remaining))
+
+
+def queue_live_notification(bot, target_id: str, text: str, *, base_delay: float = 0.0, **kwargs) -> float:
+    """
+    Schedule a live notification through the dispatcher with per-target spacing to avoid flood control.
+    Returns the effective delay (seconds) applied before sending.
+    """
+    target_key = str(target_id)
+    target_gap = _get_live_gap_for_target(target_key)
+    with _live_send_lock:
+        now = time.time()
+        next_available = _live_send_schedule.get(target_key, now)
+        earliest = max(now, next_available)
+        scheduled = earliest + max(base_delay, 0.0)
+        effective_delay = max(0.0, scheduled - now)
+        _last_live_scheduled[target_key] = scheduled
+        _live_send_schedule[target_key] = scheduled + target_gap
+        _cleanup_live_schedule_locked(now)
+    safe_send_message(
+        bot,
+        target_id,
+        text,
+        delay=effective_delay,
+        **kwargs,
+    )
+    return effective_delay
+
+
+def wait_for_live_queue_flush(pending_live: int = 0, *, buffer: float = 0.4, targets: tuple[str, ...] | None = None):
+    """
+    Best-effort wait until all queued live notifications finish sending.
+    Sleeps until the last scheduled live send time has passed, then blocks on the
+    dispatcher (if available) for a short period to let remaining tasks drain.
+    """
+    if pending_live <= 0:
+        return
+
+    with _live_send_lock:
+        if targets:
+            relevant_times = [
+                _last_live_scheduled.get(str(target))
+                for target in targets
+                if _last_live_scheduled.get(str(target)) is not None
+            ]
+        else:
+            relevant_times = list(_last_live_scheduled.values())
+
+        last_scheduled = max(relevant_times) if relevant_times else None
+
+    if last_scheduled is None:
+        return
+
+    remaining = last_scheduled - time.time()
+    if remaining > 0:
+        sleep_duration = remaining + max(buffer, 0.1)
+        logger.debug(
+            f"[QUEUE FLUSH] Waiting {sleep_duration:.2f}s for {pending_live} live notifications to finish."
+        )
+        time.sleep(sleep_duration)
+
+    if _dispatcher:
+        extra_timeout = max(5.0, pending_live * 0.35)
+        if not _dispatcher.wait_until_idle(timeout=extra_timeout):
+            logger.warning(
+                f"[QUEUE FLUSH] Dispatcher still busy after waiting {extra_timeout:.1f}s (pending_live={pending_live})."
+            )
+
 
 # ================================================================
 # ⚠️ EXCEPTIONS
@@ -193,10 +361,14 @@ def clear_stop_event(chat_id: str):
 
 
 def is_stop_requested(chat_id: str):
-    """Check both memory and file stop flags."""
-    ev = stop_events.get(chat_id)
-    if ev and ev.is_set():
-        return True
+    """Check both memory and file stop flags. Thread-safe for concurrent users."""
+    # ✅ Thread-safe: Read from dictionary with lock protection
+    with stop_events_lock:
+        ev = stop_events.get(chat_id)
+        if ev and ev.is_set():
+            return True
+    
+    # ✅ Fallback: Check file system (atomic operation, no lock needed)
     if os.path.exists(f"fstop{chat_id}.stop"):
         return True
     return False
@@ -389,44 +561,76 @@ def run_mass_check_thread(bot, message, allowed_users=None):
     """Spawn a per-user background thread to run handle_file()."""
     chat_id = str(message.chat.id)
 
-    if chat_id in activechecks:
-        bot.reply_to(message, "⚠ Already running. Please wait for your previous session.")
-        return
-
     t = threading.Thread(
         target=handle_file,
         args=(bot, message, allowed_users),
         daemon=True
     )
-    activechecks[chat_id] = t
+
+    if not _register_active_thread(chat_id, t):
+        bot.reply_to(message, "⚠ Already running. Please wait for your previous session.")
+        return
+
     t.start()
     logger.info(f"[THREAD] Mass check thread launched for {chat_id}")
 
 
 # ================================================================
-# 📂 MAIN MASS CHECK HANDLER
+# 📂 MAIN MASS CHECK HANDLER (implementation)
 # ================================================================
-def handle_file(bot, message, allowed_users=None):
+def _handle_file_impl(bot, message, allowed_users):
     chat_id = str(message.chat.id)
+
+    def _get_active_sites():
+        try:
+            state = _load_state(chat_id)
+            return state.get(str(chat_id), {}).get("sites", {})
+        except Exception:
+            return {}
+
+    def _has_active_sites():
+        return bool(_get_active_sites())
+
+    all_sites_dead_announced = threading.Event()
+    all_sites_dead_lock = threading.Lock()
+
+    # --- Step 0: check if user still has active sites ---
+    try:
+        state = _load_state(chat_id)
+        user_sites = state.get(str(chat_id), {}).get("sites", {})
+    except Exception as e:
+        user_sites = {}
+        print(f"[WARN] Could not load sites for {chat_id}: {e}")
+
+    if not user_sites:
+        bot.send_message(
+            chat_id,
+            "⚠️ All your sites are dead or removed. Please add new ones before running mass check again."
+        )
+        print(f"[ABORT] No active sites found for {chat_id}. Skipping mass check.")
+        return
+
+    # ✅ Check access before continuing
+    if allowed_users is not None and chat_id not in allowed_users:
+        bot.reply_to(message, "🚫 You are not allowed to use this bot.")
+        return
+
+
+    # ✅ Initialize stop event for this user
     stop_event = get_stop_event(chat_id)
 
+
     # 🚦 Prevent overlap with manual check or another mass check
-    if user_busy.get(chat_id):
+    if is_user_busy(chat_id):
         bot.reply_to(message, "⚠ You already have an active check running (manual or mass). Please wait.")
         return
 
     # 🟢 Mark user as busy
-    user_busy[chat_id] = True
+    set_user_busy(chat_id, "mass")
 
     stop_event.clear()
     clear_stop_event(chat_id)
     cleanup_all_raw_files(chat_id)
-
-
-    # Prevent overlap
-    if chat_id in activechecks and activechecks[chat_id].is_alive():
-        bot.reply_to(message, "⚠ You already have an active mass check.")
-        return
 
 
     # 🧠 Create per-user lock
@@ -468,7 +672,7 @@ def handle_file(bot, message, allowed_users=None):
         bot.reply_to(message, "❌ No valid cards found in file.")
         cleanup_user_file(chat_id)
         lock.release()
-        user_busy[chat_id] = False
+        clear_user_busy(chat_id)
         return
 
     # Initialize counters
@@ -487,6 +691,14 @@ def handle_file(bot, message, allowed_users=None):
         )
     )
 
+    # ✅ Auto-pin the progress board message
+    try:
+        bot.pin_chat_message(chat_id, reply_msg.message_id, disable_notification=True)
+        print(f"[DEBUG] Pinned progress board message {reply_msg.message_id} for {chat_id}")
+    except Exception as e:
+        # Silently fail if pinning is not allowed (e.g., user doesn't have permission)
+        print(f"[DEBUG] Could not pin message (may not have permission): {e}")
+
     # Prepare live results list
     live_cc_results = []
     raw_file = f"raw_results_{chat_id}_{int(time.time())}.txt"
@@ -502,7 +714,8 @@ def handle_file(bot, message, allowed_users=None):
             # 🧭 Watchdog thread – cancels all workers instantly when STOP is pressed
             def monitor_stop():
                 while not is_stop_requested(chat_id):
-                    time.sleep(1)
+                    if sleep_with_stop(chat_id, STOP_CHECK_INTERVAL):
+                        break
                 try:
                     logger.warning(f"[WATCHDOG] Stop detected — shutting down executor for {chat_id}")
                     executor.shutdown(wait=False, cancel_futures=True)
@@ -515,6 +728,20 @@ def handle_file(bot, message, allowed_users=None):
             futures = []
             with user_futures_lock:
                 user_futures[chat_id] = []
+
+            last_board_update = {
+                "processed": 0,
+                "status": None,
+                "reason": None,
+                "declined": 0,
+                "processed_display": 0,
+                "declined_checkpoint": 0,
+                "last_non_decline_ts": 0.0,
+            }
+            milestone_state = {
+                "processed": 0,
+                "card": None,
+            }
 
             # 🛑 Force cancel any unfinished tasks when stop is pressed
             def cancel_pending_futures():
@@ -539,13 +766,49 @@ def handle_file(bot, message, allowed_users=None):
 
                 try:
                     user_proxy = get_user_proxy(chat_id)
-                    result_site, result = process_card_for_user_sites(
+
+                    # --- unified retry + cleanup (shared helper) ---
+                    from shared_state import try_process_with_retries
+                    from site_auth_manager import _load_state
+
+                    # --- unified retry + cleanup (shared helper) ---
+                    result_site, result = try_process_with_retries(
                         card,
                         chat_id,
-                        proxy=user_proxy,
-                        worker_id=worker_id  # 👈 pass worker_id to the manager
+                        user_proxy=user_proxy,
+                        worker_id=worker_id,
+                        stop_checker=lambda: is_stop_requested(chat_id),
                     )
-                    # 🔄 Normalize message using the same logic as manual check
+
+                    if isinstance(result, dict) and result.get("status") == "STOPPED":
+                        raise StopMassCheckException()
+
+                    # 🧠 After retries: recheck if user has any live sites left
+                    try:
+                        state = _load_state(chat_id)
+                        user_sites = state.get(str(chat_id), {}).get("sites", {})
+                    except Exception as e:
+                        user_sites = {}
+                        print(f"[WARN] Could not recheck user sites for {chat_id}: {e}")
+
+                    if not user_sites:
+                        # Only send message once, even if multiple workers detect this condition
+                        with all_sites_dead_lock:
+                            if not all_sites_dead_announced.is_set():
+                                all_sites_dead_announced.set()
+                                safe_send_message(
+                                    bot,
+                                    chat_id,
+                                    "⚠️ All your sites have died during checking. Please add new ones.",
+                                    parse_mode="HTML"
+                                )
+                                print(f"[AUTO-STOP] All sites dead for {chat_id}. Stopping checks.")
+                        set_stop_event(chat_id)  # optional: if you use stop events to halt threads
+                        return  # stop this worker early
+
+
+                    # 🔄 Normalize message using the same logic as manual check (keep your original handling below)
+
                     from site_auth_manager import normalize_result
                     if isinstance(result, dict):
                         normalized = normalize_result(result.get("status"), result.get("reason", ""))
@@ -573,8 +836,11 @@ def handle_file(bot, message, allowed_users=None):
                     raise StopMassCheckException()
 
                 elapsed = time.time() - start_time
+                finished_at = datetime.now(timezone.utc)
                 logger.info(f"[MassCheck] {card[:6]}**** processed in {elapsed:.2f}s → {result.get('status')}")
-                return (card, result_site, result, elapsed)
+                if sleep_with_stop(chat_id, WORKER_CARD_PAUSE):
+                    raise StopMassCheckException()
+                return (card, result_site, result, elapsed, finished_at)
 
             # ----------------------------------------------------
             # QUEUE ALL CARDS
@@ -600,13 +866,35 @@ def handle_file(bot, message, allowed_users=None):
                         break
 
                     try:
-                        card_result = future.result(timeout=45)
+                        if future.cancelled():
+                            continue
+                        card_result = future.result()
                         if not card_result:
                             continue
 
-                        card, result_site, result, elapsed = card_result
+                        card, result_site, result, elapsed, finished_at = card_result
+                        termination_message = "All your sites have died during checking. Please add new ones."
+
+                        if not all_sites_dead_announced.is_set():
+                            no_sites_left = not _has_active_sites()
+                            result_reason = ""
+                            if isinstance(result, dict):
+                                result_reason = (result.get("reason") or "").strip()
+
+                            if no_sites_left or result_reason == termination_message:
+                                all_sites_dead_announced.set()
+                                safe_send_message(
+                                    bot,
+                                    chat_id,
+                                    termination_message,
+                                    parse_mode="HTML"
+                                )
+                                cancel_pending_futures()
+                                set_stop_event(chat_id)
+                                break
                         status = result.get("status", "DECLINED")
                         message_text = result.get("message", result.get("reason", "Unknown response."))
+                        checked_at_text = finished_at.strftime("%Y-%m-%d %H:%M:%S UTC")
 
                         # 🧩 Clarify declined reasons for mass check inline board
                         if status.upper() == "DECLINED":
@@ -645,10 +933,11 @@ def handle_file(bot, message, allowed_users=None):
 
                         emoji_map = {
                             "CCN": "🔥",
+                            "APPROVED": "✅",
                             "DECLINED": " ",
                             "PAYMENT_ADDED": "✅",
                             "CARD ADDED": "✅",
-                            "INSUFFICIENT_FUNDS": "😢",
+                            "INSUFFICIENT_FUNDS": "⚠️",
                             "CVV": "⚠️",
                             "3DS_REQUIRED": "⚠️"
                         }
@@ -663,13 +952,16 @@ def handle_file(bot, message, allowed_users=None):
                             top_status, count_as, send_message = "Declined ❌", "declined", False
 
                         elif any(x in msg_lower for x in ["does not support", "unsupported", "not supported"]):
-                            top_status, count_as, send_message = "CVV ⚠️", "cvv", True
+                            top_status, count_as, send_message = "Approved ✅", "cvv", True
+                            status = "APPROVED"
+                            emoji = "✅"
 
                         elif any(x in msg_lower for x in ["requires_action", "3ds", "authentication required"]):
-                            top_status, count_as, send_message = "3DS ⚠️", "threed", True
+                            top_status, count_as, send_message = "3DS", "threed", True
 
                         elif any(x in msg_lower for x in ["insufficient", "low balance", "not enough funds"]):
-                            top_status, count_as, send_message = "Insufficient Funds 💵", "low", True
+                            top_status, count_as, send_message = "LOW FUNDS", "low", True
+                            message_text = "Your card has insufficient funds."
 
                         elif any(x in msg_lower for x in [
                             "security", "cvc", "cvv", "invalid cvc", "incorrect cvc",
@@ -700,16 +992,10 @@ def handle_file(bot, message, allowed_users=None):
                                 "bank": result.get("bank", ""),
                                 "country": result.get("country", ""),
                                 "proxy": result.get("_used_proxy", False),
-                                "message": message_text
+                                "message": message_text,
+                                "checked_at": checked_at_text,
                             }
                             save_live_cc_to_json(chat_id, worker_id, live_entry)
-
-                        # -----------------------------------------
-                        # Update counters safely
-                        # -----------------------------------------
-                        with progress_lock:
-                            counters["total_processed"] += 1
-                            counters[count_as] += 1
 
                         # -----------------------------------------
                         # 💬 BUILD RESULT MESSAGE (user output)
@@ -754,11 +1040,16 @@ def handle_file(bot, message, allowed_users=None):
                                 if status == "CARD ADDED":
                                     status = "Card Added"
                                 # Build detailed message
+                                status_display = f"{status}{emoji}".rstrip()
+                                if status == "3DS_REQUIRED":
+                                    status_display = "⚠️ Requires Action"
+                                elif status == "INSUFFICIENT_FUNDS":
+                                    status_display = "⚠️ Insufficient Funds"
                                 detail_msg = (
-                                    f"<code><b>{top_status}</b></code>\n"
+                                    f"<b>{top_status}</b>\n"
                                     f"━━━━━━━━━━━━━━━━━━\n"
                                     f"<code>✧ <b>Card:</b></code> <code>{card}</code>\n"
-                                    f"<code>✧ <b>Status:</b> {status}{emoji}</code>\n"
+                                    f"<code>✧ <b>Status:</b> {status_display}</code>\n"
                                     f"<code>✧ <b>Message:</b> {message_text}</code>\n"
                                     f"<code>✧ <b>Type:</b> {scheme} | {ctype} | {brand}</code>\n"
                                     f"<code>✧ <b>Bank:</b> {escape(bank)}</code>\n"
@@ -766,11 +1057,14 @@ def handle_file(bot, message, allowed_users=None):
                                     f"<code>✧ <b>Proxy:</b> {proxy_state}</code>"
                                     f"{f' <code>[{site_num}]</code>' if site_num else ''}\n"
                                     f"<code>✧ <b>Checked by:</b></code><code>{escape(username_display)}</code> <code>[</code><code>{chat_id}</code><code>]</code>\n"
-                                    f"<code>✧ <b>Time:</b> {elapsed:.2f}s ⏳</code>\n"
+                                    f"<code>✧ <b>Duration:</b> {elapsed:.2f}s ⏳</code>\n"
                                     f"━━━━━━━━━━━━━━━━━━\n"
                                 )
 
                                 # Save & send live message
+                                if sleep_with_stop(chat_id, 0.05):
+                                    raise StopMassCheckException()
+
                                 with outfile_lock:
                                     live_cc_results.append({
                                         "cc": card,
@@ -780,7 +1074,9 @@ def handle_file(bot, message, allowed_users=None):
                                         "brand": brand,
                                         "bank": bank,
                                         "country": country,
-                                        "proxy": proxy_state
+                                        "proxy": proxy_state,
+                                        "checked_at": checked_at_text,
+                                        "duration": elapsed,
                                     })
                                     save_live_cc_to_json(chat_id, worker_id, {
                                         "cc": card,
@@ -790,41 +1086,73 @@ def handle_file(bot, message, allowed_users=None):
                                         "brand": brand,
                                         "bank": bank,
                                         "country": country,
-                                        "proxy": proxy_state
+                                        "proxy": proxy_state,
+                                        "checked_at": checked_at_text,
+                                        "duration": elapsed,
                                     })
 
-                                    time.sleep(0.05)
-                                    if idx % 5000 == 0:  # every 50 cards checked
-                                        cleanup_user_json(chat_id)                                
-                                        
+                                    if idx % 5000 == 0:
+                                        cleanup_user_json(chat_id)
+
                                     outfile.write(detail_msg + "\n")
                                     outfile.flush()
-                                    # 🕒 Send with a 2-second gap to avoid flood limits
-                                    safe_send_message(
-                                        bot, chat_id, detail_msg,
+
+                                if is_stop_requested(chat_id):
+                                    raise StopMassCheckException()
+
+                                try:
+                                    queue_live_notification(
+                                        bot,
+                                        chat_id,
+                                        detail_msg,
                                         parse_mode="HTML",
-                                        disable_web_page_preview=True
+                                        disable_web_page_preview=True,
                                     )
-                                    time.sleep(2)  # delay between messages
+                                except Exception as e:
+                                    logger.warning(f"[LIVE RESULT ERROR] Failed to queue user message: {e}")
 
-                                    # Also forward to channel (optional)
-                                    try:
-                                        safe_send_message(
-                                            bot, CHANNEL_ID, detail_msg,
-                                            parse_mode="HTML",
-                                            disable_web_page_preview=True
-                                        )
-                                        time.sleep(2)  # delay before next message too
-                                    except Exception as e:
-                                        logger.warning(f"[CHANNEL LIVE SEND ERROR] {e}")
-
+                                try:
+                                    queue_live_notification(
+                                        bot,
+                                        CHANNEL_ID,
+                                        detail_msg,
+                                        parse_mode="HTML",
+                                        disable_web_page_preview=True,
+                                    )
+                                except Exception as e:
+                                    logger.warning(f"[CHANNEL LIVE SEND ERROR] {e}")
 
                             except Exception as e:
                                 logger.warning(f"[LIVE RESULT ERROR] {e}")
                         # -----------------------------------------
                         # 🔁 UPDATE PROGRESS BOARD
                         # -----------------------------------------
+                        msg_lower = message_text.lower()
+                        short_reason = message_text
+                        if any(x in msg_lower for x in ["card number is incorrect", "your card is incorrect", "incorrect number"]):
+                            short_reason = "Your card number is incorrect"
+                        elif any(x in msg_lower for x in ["does not support", "unsupported"]):
+                            short_reason = "Your card does not support this type of purchase"
+                        elif any(x in msg_lower for x in ["requires_action", "3ds", "authentication required"]):
+                            short_reason = "3DS"
+                        elif any(x in msg_lower for x in ["insufficient", "low balance"]):
+                            short_reason = "Insufficient funds"
+                        elif any(x in msg_lower for x in ["security code", "cvc", "cvv"]):
+                            short_reason = "You card Security is incorrect"
+                        elif any(x in msg_lower for x in ["expired", "expiration"]):
+                            short_reason = "Card expired"
+                        elif "stripe" in msg_lower:
+                            short_reason = "Stripe Token Error"
+                        elif "site" in msg_lower:
+                            short_reason = "Site Response Failed"
+
+                        is_declined_status = top_status.strip().upper().startswith("DECLINED")
+                        board_update_payload = None
+
                         with progress_lock:
+                            counters["total_processed"] += 1
+                            counters[count_as] += 1
+
                             processed = counters["total_processed"]
                             total_cards = counters["total_cards"]
                             cvv = counters["cvv"]
@@ -832,66 +1160,110 @@ def handle_file(bot, message, allowed_users=None):
                             threed = counters["threed"]
                             low = counters["low"]
                             declined = counters["declined"]
-                            # ✅ Shorter reason display
-                            # ✅ Shorter reason display for progress summary
-                            msg_lower = message_text.lower()
-                            if any(x in msg_lower for x in ["card number is incorrect", "your card is incorrect", "incorrect number"]):
-                                short_reason = "Your card number is incorrect"
-                            elif any(x in msg_lower for x in ["does not support", "unsupported"]):
-                                short_reason = "Your card does not support this type of purchase"
-                            elif any(x in msg_lower for x in ["requires_action", "3ds", "authentication required"]):
-                                short_reason = "3DS"
-                            elif any(x in msg_lower for x in ["insufficient", "low balance"]):
-                                short_reason = "Insufficient funds"
-                            elif any(x in msg_lower for x in ["security code", "cvc", "cvv"]):
-                                short_reason = "You card Security is incorrect"
-                            elif any(x in msg_lower for x in ["expired", "expiration"]):
-                                short_reason = "Card expired"
-                            elif "stripe" in msg_lower:
-                                short_reason = "Stripe Token Error"
-                            elif "site" in msg_lower:
-                                short_reason = "Site Response Failed"
-                            else:
-                                short_reason = message_text
 
+                            now_ts = time.time()
 
+                            milestone_candidate = milestone_state["processed"]
+                            if processed == total_cards or total_cards < 5:
+                                milestone_candidate = processed
+                            elif processed >= 5 and processed % 5 == 0:
+                                milestone_candidate = processed
 
-                                                        
+                            if milestone_candidate != milestone_state["processed"] and processed == milestone_candidate:
+                                milestone_state["processed"] = milestone_candidate
+                                milestone_state["card"] = card
 
-                        checking = not is_stop_requested(chat_id)
-                        status_text = f"Processing {processed}/{total_cards} cards..."
-                        kb = build_status_keyboard(
-                            card, total_cards, processed, top_status,
-                            cvv, ccn, threed, low, declined,
-                            checking, chat_id,
-                            reason=short_reason
-                        )
+                            if processed == total_cards:
+                                milestone_state["processed"] = processed
+                                milestone_state["card"] = card
 
-                        try:
-                            bot.edit_message_text(
-                                chat_id=reply_msg.chat.id,
-                                message_id=reply_msg.message_id,
-                                text=status_text,
-                                reply_markup=kb,
+                            display_processed = milestone_state["processed"]
+                            if display_processed == 0:
+                                if processed == total_cards or total_cards < 5:
+                                    display_processed = processed
+
+                            display_card = milestone_state["card"] if milestone_state["card"] else card
+
+                            declined_since_last = declined - last_board_update["declined_checkpoint"]
+
+                            should_update_board = False
+                            if processed == total_cards and last_board_update["processed_display"] != processed:
+                                should_update_board = True
+                            elif display_processed > last_board_update["processed_display"]:
+                                should_update_board = True
+                            elif not is_declined_status:
+                                if now_ts - last_board_update["last_non_decline_ts"] >= 1.0:
+                                    should_update_board = True
+                            elif declined_since_last >= DECLINED_UPDATE_GAP:
+                                should_update_board = True
+
+                            if should_update_board:
+                                last_board_update.update({
+                                    "processed": processed,
+                                    "status": top_status,
+                                    "reason": short_reason,
+                                    "declined": declined,
+                                    "processed_display": display_processed,
+                                    "declined_checkpoint": declined,
+                                })
+                                if not is_declined_status:
+                                    last_board_update["last_non_decline_ts"] = now_ts
+                                board_update_payload = {
+                                    "card": display_card,
+                                    "processed_display": display_processed,
+                                    "total_cards": total_cards,
+                                    "status": top_status,
+                                    "reason": short_reason,
+                                    "cvv": cvv,
+                                    "ccn": ccn,
+                                    "threed": threed,
+                                    "low": low,
+                                    "declined": declined,
+                                }
+
+                        if board_update_payload:
+                            checking = not is_stop_requested(chat_id)
+                            status_text = f"Processing {board_update_payload['processed_display']}/{board_update_payload['total_cards']} cards..."
+                            kb = build_status_keyboard(
+                                board_update_payload["card"],
+                                board_update_payload["total_cards"],
+                                board_update_payload["processed_display"],
+                                board_update_payload["status"],
+                                board_update_payload["cvv"],
+                                board_update_payload["ccn"],
+                                board_update_payload["threed"],
+                                board_update_payload["low"],
+                                board_update_payload["declined"],
+                                checking,
+                                chat_id,
+                                reason=board_update_payload["reason"],
                             )
-                        except Exception as e:
-                            if "message is not modified" not in str(e).lower():
-                                logger.info(f"[PROGRESS BOARD ERROR] {e}")
+
+                            try:
+                                bot.edit_message_text(
+                                    chat_id=reply_msg.chat.id,
+                                    message_id=reply_msg.message_id,
+                                    text=status_text,
+                                    reply_markup=kb,
+                                )
+                            except Exception as e:
+                                if "message is not modified" not in str(e).lower():
+                                    logger.info(f"[PROGRESS BOARD ERROR] {e}")
 
                         # -----------------------------------------
-                        # 🕒 Silent cooldown every 5 cards (no visible pause)
+                        # 🕒 Lightweight cooldown every 20 cards (maintains responsiveness)
                         # -----------------------------------------
-                        if idx % 5 == 0 and not is_stop_requested(chat_id):
-                            pause_time = 1  # seconds of cooldown
-                            for _ in range(pause_time):
-                                if is_stop_requested(chat_id):
-                                    raise StopMassCheckException()
-                                time.sleep(1)  # silent delay, no UI updates
+                        if idx % 20 == 0 and not is_stop_requested(chat_id):
+                            if sleep_with_stop(chat_id, 0.15):
+                                raise StopMassCheckException()
 
-                        # Small per-card delay to reduce flood risk
-                        time.sleep(0.3)
+                        # Micro pause per card to keep stop checks snappy
+                        if sleep_with_stop(chat_id, 0.05):
+                            raise StopMassCheckException()
 
                     # end try (per future)
+                    except CancelledError:
+                        continue
                     except StopMassCheckException:
                         logger.info(f"[MassCheck] Stop requested for {chat_id}")
                         break
@@ -928,6 +1300,9 @@ def handle_file(bot, message, allowed_users=None):
                 live_count = len(live_cc_results)
                 total = counters["total_processed"]
                 cancel_pending_futures()
+
+                if live_count > 0:
+                    wait_for_live_queue_flush(live_count, targets=(chat_id, CHANNEL_ID))
 
 
                 summary = (
@@ -966,7 +1341,7 @@ def handle_file(bot, message, allowed_users=None):
 
                     # 🕐 Wait before deleting raw result files
                     logger.info(f"[STOP CLEANUP] Waiting 5s before deleting raw files for {chat_id}")
-                    time.sleep(1)
+                    sleep_with_stop(chat_id, 1.0)
 
                     try:
                         cleanup_all_raw_files(chat_id)
@@ -979,6 +1354,11 @@ def handle_file(bot, message, allowed_users=None):
                     except Exception:
                         pass
 
+                # ✅ Unpin and delete progress board on stop
+                try:
+                    bot.unpin_chat_message(chat_id, reply_msg.message_id)
+                except Exception:
+                    pass  # Message might already be unpinned or deleted
                 try:
                     bot.delete_message(reply_msg.chat.id, reply_msg.message_id)
                 except Exception:
@@ -989,10 +1369,7 @@ def handle_file(bot, message, allowed_users=None):
                     # Release user lock and busy flag *immediately* so interface unfreezes
                     if lock.locked():
                         lock.release()
-                    user_busy[chat_id] = False
-
-                    # Remove tracking entry
-                    activechecks.pop(chat_id, None)
+                    clear_user_busy(chat_id)
 
                     # Clear stop event so the user can restart right away
                     clear_stop_event(chat_id)
@@ -1027,6 +1404,11 @@ def handle_file(bot, message, allowed_users=None):
                 f"<b>DECLINED:</b> {counters['declined']}\n"
             )
 
+            # ✅ Unpin and delete progress board on completion
+            try:
+                bot.unpin_chat_message(chat_id, reply_msg.message_id)
+            except Exception:
+                pass  # Message might already be unpinned or deleted
             try:
                 bot.delete_message(reply_msg.chat.id, reply_msg.message_id)
             except Exception:
@@ -1038,6 +1420,7 @@ def handle_file(bot, message, allowed_users=None):
 
             # Send results file
             if live_count > 0:
+                wait_for_live_queue_flush(live_count, targets=(chat_id, CHANNEL_ID))
                 try:
                     bot.send_message(chat_id, summary, parse_mode="HTML")
                 except Exception:
@@ -1076,7 +1459,7 @@ def handle_file(bot, message, allowed_users=None):
         # ============================================================
         try:
             # ⏳ Wait briefly to ensure all threads and file handles are fully released
-            time.sleep(1.5)
+            sleep_with_stop(chat_id, 1.5)
 
             # 🔒 Explicitly close all file handles to avoid Windows "in use" error
             for obj in globals().values():
@@ -1090,15 +1473,9 @@ def handle_file(bot, message, allowed_users=None):
             cleanup_user_file(chat_id)
 
             # 🧹 Delay raw result cleanup to ensure outfile handle fully closed
-            time.sleep(0.5)
+            sleep_with_stop(chat_id, 0.5)
             cleanup_all_raw_files(chat_id)
-            user_busy.pop(chat_id, None)
-            activechecks.pop(chat_id, None)
-
-
-            # 🧠 Remove user tracking safely
-            if chat_id in activechecks:
-                del activechecks[chat_id]
+            clear_user_busy(chat_id)
 
             if lock.locked():
                 lock.release()
@@ -1109,8 +1486,27 @@ def handle_file(bot, message, allowed_users=None):
             logger.error(f"[FINAL CLEANUP ERROR] {e}")
 
         # Schedule delayed recheck cleanup in 5s (ensures deletion after background threads)
-        user_busy[chat_id] = False
+        clear_user_busy(chat_id)
         threading.Timer(5.0, cleanup_all_raw_files, args=(chat_id,)).start()
+
+
+def handle_file(bot, message, allowed_users):
+    """
+    Public entry point that ensures per-user thread tracking before delegating to the
+    implementation. This wrapper lets callers start the worker either directly or via
+    run_mass_check_thread while keeping concurrency guards consistent.
+    """
+    chat_id = str(message.chat.id)
+    current_thread = threading.current_thread()
+
+    if not _register_active_thread(chat_id, current_thread):
+        bot.reply_to(message, "⚠ You already have an active mass check.")
+        return
+
+    try:
+        _handle_file_impl(bot, message, allowed_users)
+    finally:
+        _clear_active_thread(chat_id, current_thread)
 
 
 def merge_livecc_user_files(user_id: str, max_workers: int = 5):
@@ -1129,4 +1525,5 @@ def merge_livecc_user_files(user_id: str, max_workers: int = 5):
         json.dump(all_data, f, indent=2, ensure_ascii=False)
     logger.info(f"[MERGED LIVECC] Saved {len(all_data)} results to {merged_file}")
     return merged_file
+
 

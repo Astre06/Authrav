@@ -42,7 +42,12 @@ ADMIN_ID = cfg["ADMIN_ID"]
 MAX_WORKERS = cfg["MAX_WORKERS"]
 BATCH_SIZE = cfg["BATCH_SIZE"]
 DELAY_BETWEEN_BATCHES = cfg["DELAY_BETWEEN_BATCHES"]
-from shared_state import save_live_cc_to_json
+from shared_state import (
+    save_live_cc_to_json,
+    is_user_busy as shared_is_user_busy,
+    busy_snapshot,
+    clear_user_busy,
+)
 from proxy_manager import (
     add_user_proxy,
     replace_user_proxies,
@@ -53,33 +58,42 @@ from proxy_manager import (
 
 
 from mass_check import (
-    handle_file as handle_mass_file,
+    handle_file,
     run_mass_check_thread,   # thread launcher we use on file upload
     get_stop_event,
     set_stop_event,
     clear_stop_event,
     is_stop_requested,
     stop_events,
+    set_dispatcher as set_mass_dispatcher,
+    is_mass_check_active,
 )
 
 
-from manual_check import register_manual_check
+from manual_check import (
+    register_manual_check,
+    user_locks,
+    user_locks_lock,
+    set_dispatcher as set_manual_dispatcher,
+)
 from proxy_manager import parse_proxy_line
 from proxy_check import register_checkproxy
 from site_auth_manager import (
     SiteAuthManager,
     _load_state,
     _save_state,
+    _normalize_site_key,
     process_card_for_user_sites,
 )
+from dispatcher import MessageDispatcher
 
 # Global dictionary to hold temporary site input for each user
 user_sites = {}
+BUSY_TIMEOUT_SECONDS = 600
+
 # ================================================================
 # 🚦 USER BUSY TRACKER
 # ================================================================
-from shared_state import user_busy
-
 def safe_load_state(chat_id):
     try:
         return _load_state(chat_id)
@@ -180,17 +194,12 @@ bot.send_document = _safe_wrapper("send_document", _original_send_document)
 bot.send_photo = _safe_wrapper("send_photo", _original_send_photo)
 bot.send_video = _safe_wrapper("send_video", _original_send_video)
 
-# Register mass check system (STOP + Resume callbacks)
-from mass_check import activechecks
-from manual_check import user_locks, user_locks_lock
 clean_waiting_users = set()
 def is_user_busy(chat_id: str):
     """Return True if user currently has an active mass or manual check."""
-    if user_busy.get(chat_id):  # 🔹 ADD THIS LINE
+    if shared_is_user_busy(chat_id):
         return True
-
-    # Mass check running?
-    if chat_id in activechecks:
+    if is_mass_check_active(chat_id):
         return True
 
     # Manual check running?
@@ -204,12 +213,24 @@ def is_user_busy(chat_id: str):
 # ============================================================
 # 🧩 Safe Telegram Sender (Flood Control & Retry-Aware)
 # ============================================================
+message_dispatcher = None
+
+
+def set_message_dispatcher(dispatcher: MessageDispatcher):
+    global message_dispatcher
+    message_dispatcher = dispatcher
+
+
 def safe_send(bot, method, *args, **kwargs):
     """
     Thread-safe Telegram sender with rate-limit protection and retry-after support.
     Usage:
         safe_send(bot, "send_message", chat_id, text, parse_mode="HTML")
     """
+
+    if message_dispatcher:
+        message_dispatcher.enqueue(method, *args, **kwargs)
+        return
 
     def run():
         max_attempts = 3  # Prevent infinite loops
@@ -223,7 +244,6 @@ def safe_send(bot, method, *args, **kwargs):
             except telebot.apihelper.ApiTelegramException as e:
                 err_text = str(e)
                 if "Too Many Requests" in err_text:
-                    # Extract retry time safely
                     import re
                     match = re.search(r"retry after (\d+)", err_text)
                     wait = int(match.group(1)) if match else 5
@@ -243,6 +263,46 @@ def safe_send(bot, method, *args, **kwargs):
     threading.Thread(target=run, daemon=True).start()
 
 
+def start_busy_watchdog(bot, timeout: int = BUSY_TIMEOUT_SECONDS, interval: int = 60):
+    """Background watchdog that clears stale busy flags and notifies users."""
+
+    def monitor():
+        while True:
+            time.sleep(interval)
+            snapshot = busy_snapshot()
+            now = time.time()
+            for chat_id, info in snapshot.items():
+                started = info.get("started")
+                if not started:
+                    continue
+                if now - started < timeout:
+                    continue
+
+                label = info.get("label", "unknown")
+                logging.warning(f"[BUSY WATCHDOG] Clearing stale '{label}' session for user {chat_id}")
+                if label == "mass":
+                    logging.info(f"[BUSY WATCHDOG] Mass check for {chat_id} exceeded timeout; skipping auto-stop per configuration.")
+                    continue
+                safe_send(
+                    bot,
+                    "send_message",
+                    chat_id,
+                    "⚠️ Your previous check timed out and has been reset. Please try again.",
+                    parse_mode="HTML",
+                )
+                clear_user_busy(chat_id)
+
+    threading.Thread(target=monitor, daemon=True).start()
+
+
+# Centralized dispatcher for Telegram calls
+dispatcher = MessageDispatcher(bot, rate_per_second=20, max_retries=5)
+set_message_dispatcher(dispatcher)
+set_manual_dispatcher(dispatcher)
+set_mass_dispatcher(dispatcher)
+start_busy_watchdog(bot)
+
+
 from cardgen import (
     generate_luhn_cards_parallel,
     generate_luhn_cards_fixed_expiry,
@@ -254,11 +314,6 @@ from bininfo import round_robin_bin_lookup
 from sitechk import get_base_url
 from proxy_manager import parse_proxy_line
 from manual_check import register_manual_check
-from mass_check import handle_file
-
-
-
-
 # -------------------------------------------------
 # Base Directory
 # -------------------------------------------------
@@ -382,6 +437,10 @@ def load_allowed_users():
     else:
         logging.warning(f"[LOAD WARN] {ALLOWED_FILE} not found — starting with empty list")
         return []
+
+def check_access(chat_id):
+    """Return True if user is allowed, False otherwise."""
+    return str(chat_id) in allowed_users
 
 # Load existing allowed users or create an empty list
 if os.path.exists(ALLOWED_FILE):
@@ -1722,11 +1781,28 @@ def sitelist(message):
         )
         return
 
-    runtime_defaults = [s.rstrip("/") for s in get_all_default_sites()]
+    ensure_user_site_exists(chat_id)
+
+    def unique_sites(values):
+        seen = set()
+        ordered = []
+        iterable = values or []
+        for raw in iterable:
+            normalized = _normalize_site_key(raw)
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            ordered.append(normalized)
+        return ordered
+
+    runtime_defaults = unique_sites(get_all_default_sites())
     state = _load_state(chat_id)
     user_data = state.get(chat_id, {}) if state else {}
-    user_sites = [s.rstrip("/") for s in user_data.get("sites", {}).keys()]
-    defaults_snapshot = [s.rstrip("/") for s in user_data.get("defaults_snapshot", [])]
+    user_sites = unique_sites(user_data.get("sites", {}).keys())
+    defaults_snapshot = unique_sites(user_data.get("defaults_snapshot", []))
+    runtime_default_set = set(runtime_defaults)
+    user_site_set = set(user_sites)
+    defaults_snapshot_set = set(defaults_snapshot)
 
     # ADMIN LOGIC
     if is_admin:
@@ -1758,8 +1834,8 @@ def sitelist(message):
     else:
         if (
             not user_sites
-            or (defaults_snapshot and set(user_sites) == set(defaults_snapshot))
-            or (not defaults_snapshot and set(user_sites) == set(runtime_defaults))
+            or (defaults_snapshot_set and user_site_set == defaults_snapshot_set)
+            or (not defaults_snapshot_set and user_site_set == runtime_default_set)
         ):
             sent_msg = bot.send_message(
                 chat_id,
@@ -1771,7 +1847,7 @@ def sitelist(message):
             custom_sites = [
                 s
                 for s in user_sites
-                if s not in runtime_defaults and s not in defaults_snapshot
+                if s not in runtime_default_set and s not in defaults_snapshot_set
             ]
             if not custom_sites and user_sites:
                 custom_sites = user_sites
@@ -2572,8 +2648,7 @@ def handle_clean_file(message):
     # ⚙️ If user is not in cleaning mode, file goes to mass check
     if chat_id not in waiting_for_clean:
         try:
-            from mass_check import handle_file
-            handle_file(bot, message, allowed_users)
+            run_mass_check_thread(bot, message, allowed_users)
         except Exception as e:
             bot.reply_to(message, f"⚠️ Error processing file in mass check: {e}")
         return
@@ -2669,6 +2744,15 @@ def handle_clean_buttons(call):
 def mass_command_handler(message):
     chat_id = str(message.chat.id)
 
+    # ✅ Restrict access
+    if chat_id not in allowed_users:
+        bot.reply_to(message, "🚫 You are not allowed to use /mass.")
+        return
+
+    # 🧩 Continue with your existing logic
+    # (e.g., check reply_to_message, download file, etc.)
+
+
     try:
         # 🧩 Prevent running if user is currently cleaning
         if chat_id in clean_waiting_users:
@@ -2690,17 +2774,14 @@ def mass_command_handler(message):
             if doc.file_name.endswith(".txt"):
                 clear_stop_event(chat_id)
 
-                # Start mass check silently in background
-                threading.Thread(
-                    target=handle_file,
-                    args=(bot, replied),
-                    daemon=True
-                ).start()
+                # ✅ Start mass check silently in background
+                run_mass_check_thread(bot, replied, allowed_users)
                 logging.debug(f"[MASS] Started mass check thread for {chat_id}")
                 return
             else:
                 bot.reply_to(message, "❌ Replied file must be a .txt file.")
                 return
+
 
         # ----------------------------------------------------------
         # Case 2: replied to plain text (cards pasted directly)
@@ -2713,7 +2794,7 @@ def mass_command_handler(message):
             # Start mass check silently
             threading.Thread(
                 target=handle_file,
-                args=(bot, message),
+                args=(bot, message, allowed_users),
                 daemon=True
             ).start()
             logging.debug(f"[MASS] Started mass check from text for {chat_id}")
@@ -2830,13 +2911,7 @@ def mass_check_handler(message):
         reset_user_states(chat_id)
         clear_stop_event(chat_id)
 
-        # Launch mass check thread
-        t = threading.Thread(
-            target=handle_file,
-            args=(bot, message, allowed_users),
-            daemon=True,
-        )
-        t.start()
+        run_mass_check_thread(bot, message, allowed_users)
         logging.debug(f"[THREAD STARTED] Mass check thread for {chat_id}")
 
     except Exception as e:
@@ -3222,11 +3297,27 @@ def fallback(message):
 
 def main():
     logging.info("Astree Bot Running…")
-    try:
-        bot.infinity_polling(timeout=60, long_polling_timeout=10)
-    except Exception as e:
-        logging.critical(f"Bot crashed: {e}")
-        raise
+    backoff = 5
+    while True:
+        try:
+            bot.infinity_polling(timeout=60, long_polling_timeout=10)
+        except KeyboardInterrupt:
+            logging.info("Shutdown requested by operator.")
+            break
+        except Exception as e:
+            logging.critical("Bot polling crashed: %s", e, exc_info=True)
+            wait = backoff
+            logging.info("Restarting polling in %s seconds…", wait)
+            time.sleep(wait)
+            backoff = min(backoff * 2, 300)
+            continue
+        else:
+            break
+    if message_dispatcher:
+        try:
+            message_dispatcher.shutdown(timeout=5)
+        except Exception:
+            logging.exception("Failed to shut down dispatcher cleanly")
 
 
 # ================================================================
