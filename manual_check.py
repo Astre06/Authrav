@@ -241,6 +241,13 @@ def process_manual_check(bot, message, allowed_users):
                 clear_user_busy(chat_id)
                 return
 
+            # 🚫 Check if BIN is banned for this user
+            from bin_ban_manager import check_card_banned
+            is_banned, bin_code = check_card_banned(card_data, chat_id)
+            if is_banned:
+                bot.send_message(chat_id, f"🚫 This bin has banned.\nBIN: <code>{bin_code}</code>", parse_mode="HTML")
+                clear_user_busy(chat_id)
+                return
                         
             site_url, result = try_process_with_retries(
                 card_data,

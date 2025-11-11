@@ -675,11 +675,57 @@ def _handle_file_impl(bot, message, allowed_users):
         clear_user_busy(chat_id)
         return
 
+    # 🧹 Remove duplicate cards (normalize year format for comparison)
+    def normalize_card_for_duplicate(card_str: str) -> str:
+        """Normalize card format for duplicate detection (normalize YY to YYYY)."""
+        try:
+            parts = card_str.split("|")
+            if len(parts) != 4:
+                return card_str
+            
+            card_num, month, year, cvc = [p.strip() for p in parts]
+            
+            # Normalize year: convert YY to YYYY
+            if len(year) == 2:
+                year_int = int(year)
+                if year_int >= 0 and year_int <= 99:
+                    # Assume 20XX for years 00-99
+                    year = f"20{year:02d}"
+            elif len(year) == 4:
+                # Already YYYY format, keep as is
+                pass
+            else:
+                # Invalid year format, return original
+                return card_str
+            
+            # Return normalized format: card|mm|yyyy|cvc
+            return f"{card_num}|{month}|{year}|{cvc}"
+        except Exception:
+            return card_str
+    
+    # Track original count before deduplication
+    original_count = len(valid_cards)
+    
+    # Remove duplicates using normalized format
+    seen_normalized = {}
+    deduplicated_cards = []
+    
+    for card in valid_cards:
+        normalized_key = normalize_card_for_duplicate(card)
+        if normalized_key not in seen_normalized:
+            seen_normalized[normalized_key] = True
+            deduplicated_cards.append(card)  # Keep original format
+    
+    duplicates_removed = original_count - len(deduplicated_cards)
+    valid_cards = deduplicated_cards
+
     # Initialize counters
     counters = {
         "cvv": 0, "ccn": 0, "low": 0, "declined": 0,
         "threed": 0, "total_processed": 0,
         "total_cards": len(valid_cards),
+        "duplicates_removed": duplicates_removed,
+        "banned_bin": 0,  # Track cards skipped due to banned BINs
     }
 
     reply_msg = bot.reply_to(
@@ -759,6 +805,20 @@ def _handle_file_impl(bot, message, allowed_users):
                 """Worker: process a single card with instant stop checks."""
                 if is_stop_requested(chat_id):
                     raise StopMassCheckException()
+
+                # 🚫 Check if BIN is banned for this user before processing
+                from bin_ban_manager import check_card_banned
+                is_banned, bin_code = check_card_banned(card, chat_id)
+                if is_banned:
+                    # Increment banned BIN counter (thread-safe)
+                    with progress_lock:
+                        counters["banned_bin"] = counters.get("banned_bin", 0) + 1
+                    return (card, None, {
+                        "status": "DECLINED",
+                        "reason": "This bin has banned.",
+                        "bin": bin_code,
+                        "_used_proxy": False
+                    }, 0.0, datetime.now(timezone.utc))
 
                 start_time = time.time()
                 result_site = None
@@ -1308,6 +1368,8 @@ def _handle_file_impl(bot, message, allowed_users):
                 summary = (
                     f"🛑 <b>Mass Check Stopped</b>\n\n"
                     f"<b>Processed:</b> {total}/{counters['total_cards']}\n"
+                    f"<b>Duplicate Remove:</b> {counters.get('duplicates_removed', 0)}\n"
+                    f"<b>Banned BIN:</b> {counters.get('banned_bin', 0)}\n"
                     f"<b>CVV:</b> {counters['cvv']}\n"
                     f"<b>CCN:</b> {counters['ccn']}\n"
                     f"<b>3DS:</b> {counters['threed']}\n"
@@ -1397,6 +1459,8 @@ def _handle_file_impl(bot, message, allowed_users):
             summary = (
                 f"✅ <b>Mass Check Completed</b>\n"
                 f"<b>Total Processed:</b> {total}/{counters['total_cards']}\n"
+                f"<b>Duplicate Remove:</b> {counters.get('duplicates_removed', 0)}\n"
+                f"<b>Banned BIN:</b> {counters.get('banned_bin', 0)}\n"
                 f"<b>CVV:</b> {counters['cvv']}\n"
                 f"<b>CCN:</b> {counters['ccn']}\n"
                 f"<b>3DS:</b> {counters['threed']}\n"

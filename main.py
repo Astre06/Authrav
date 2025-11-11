@@ -86,6 +86,10 @@ from site_auth_manager import (
     process_card_for_user_sites,
 )
 from dispatcher import MessageDispatcher
+from bin_ban_manager import (
+    ban_bin, unban_bin, get_banned_bins_list, extract_bin,
+    check_card_banned, get_banned_bins_count
+)
 
 # Global dictionary to hold temporary site input for each user
 user_sites = {}
@@ -757,6 +761,9 @@ def show_commands(message):
             "/request – Request access\n"
             "/send <code>MESSAGE</code> – Broadcast message\n"
             "/delete <code>USER_ID</code> – Remove user\n"
+            "/ban <code>BIN</code> – Ban a BIN (auto-parses from card format)\n"
+            "/unban <code>BIN</code> – Unban a BIN\n"
+            "/banlist – Show list of banned BINs\n"
         )
         safe_send(bot, "send_message", chat_id, msg, parse_mode="HTML")
         logging.debug(f"/help full command list shown to admin {chat_id}")
@@ -3269,6 +3276,102 @@ def broadcast(message):
     logging.debug(
         f"Broadcast complete: {successes}/{len(allowed_users) + len(failures)} delivered"
     )
+
+
+# ================================================================
+# 🚫 BIN BAN MANAGEMENT COMMANDS (Admin only)
+# ================================================================
+@bot.message_handler(commands=["ban"])
+def ban_bin_command(message):
+    """Ban a BIN for the user. Usage: /ban 559888 or /ban 5598880397218308|12|2026|989"""
+    chat_id = str(message.chat.id)
+    
+    # Allow both admin and regular users to manage their own bans
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        bot.reply_to(
+            message,
+            "🚫 <b>How to ban a BIN:</b>\n\n"
+            "Use: <code>/ban (bin)</code> to ban that BIN\n\n"
+            "<b>Examples:</b>\n"
+            "• <code>/ban 559888</code>\n"
+            "• <code>/ban 5598880397218308|12|2026|989</code>\n\n"
+            "The BIN will be automatically extracted from the card format.",
+            parse_mode="HTML"
+        )
+        return
+    
+    bin_input = args[1].strip()
+    bin_code = extract_bin(bin_input)
+    
+    if not bin_code or len(bin_code) < 6:
+        bot.reply_to(message, "❌ Invalid BIN format. Please provide at least 6 digits.\nExample: /ban 559888")
+        return
+    
+    if ban_bin(bin_code, chat_id):
+        bot.reply_to(message, f"✅ BIN <code>{bin_code}</code> has been banned for your account.", parse_mode="HTML")
+        logging.info(f"User {chat_id} banned BIN: {bin_code}")
+    else:
+        bot.reply_to(message, f"⚠️ BIN <code>{bin_code}</code> is already banned.", parse_mode="HTML")
+
+
+@bot.message_handler(commands=["unban"])
+def unban_bin_command(message):
+    """Unban a BIN for the user. Usage: /unban 559888 or /unban 5598880397218308|12|2026|989"""
+    chat_id = str(message.chat.id)
+    
+    # Allow both admin and regular users to manage their own bans
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        bot.reply_to(
+            message,
+            "🚫 <b>How to unban a BIN:</b>\n\n"
+            "Use: <code>/unban (bin)</code> to unban that BIN\n\n"
+            "<b>Examples:</b>\n"
+            "• <code>/unban 559888</code>\n"
+            "• <code>/unban 5598880397218308|12|2026|989</code>\n\n"
+            "The BIN will be automatically extracted from the card format.",
+            parse_mode="HTML"
+        )
+        return
+    
+    bin_input = args[1].strip()
+    bin_code = extract_bin(bin_input)
+    
+    if not bin_code or len(bin_code) < 6:
+        bot.reply_to(message, "❌ Invalid BIN format. Please provide at least 6 digits.\nExample: /unban 559888")
+        return
+    
+    if unban_bin(bin_code, chat_id):
+        bot.reply_to(message, f"✅ BIN <code>{bin_code}</code> has been unbanned from your account.", parse_mode="HTML")
+        logging.info(f"User {chat_id} unbanned BIN: {bin_code}")
+    else:
+        bot.reply_to(message, f"⚠️ BIN <code>{bin_code}</code> is not banned.", parse_mode="HTML")
+
+
+@bot.message_handler(commands=["banlist"])
+def banlist_command(message):
+    """Show list of banned BINs for the user."""
+    chat_id = str(message.chat.id)
+    
+    # Each user sees their own ban list
+    banned_list = get_banned_bins_list(chat_id)
+    count = get_banned_bins_count(chat_id)
+    
+    if count == 0:
+        bot.reply_to(message, "📋 <b>Your Banned BINs:</b> None (0 banned)", parse_mode="HTML")
+        return
+    
+    # Format list (show max 50, then "... and X more")
+    if len(banned_list) <= 50:
+        bins_text = ", ".join([f"<code>{bin_code}</code>" for bin_code in banned_list])
+        msg = f"📋 <b>Your Banned BINs ({count}):</b>\n{bins_text}"
+    else:
+        bins_text = ", ".join([f"<code>{bin_code}</code>" for bin_code in banned_list[:50]])
+        remaining = count - 50
+        msg = f"📋 <b>Your Banned BINs ({count}):</b>\n{bins_text}\n... and {remaining} more"
+    
+    bot.reply_to(message, msg, parse_mode="HTML")
 
 
 # ================================================================

@@ -520,5 +520,14 @@
     "country": "Egypt",
     "bin": "474501",
     "display_clean": "VISA CLASSIC - PREPAID - VISA"
+  },
+  "223115": {
+    "scheme": "MASTERCARD",
+    "type": "CREDIT",
+    "brand": "GOLD",
+    "bank": "Picpay Bank Banco Multiplo S A",
+    "country": "Brazil",
+    "bin": "223115",
+    "display_clean": "GOLD - CREDIT - MASTERCARD"
   }
 }

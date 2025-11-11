@@ -151,6 +151,12 @@ def try_process_with_retries(card_data, chat_id, user_proxy=None, worker_id=None
     if should_stop():
         return None, {"status": "STOPPED", "reason": "User requested stop"}
 
+    # 🚫 Check if BIN is banned for this user before processing
+    from bin_ban_manager import check_card_banned
+    is_banned, bin_code = check_card_banned(card_data, chat_id)
+    if is_banned:
+        return None, {"status": "DECLINED", "reason": "This bin has banned.", "bin": bin_code}
+
     if not user_sites:
         return None, {"status": "DECLINED", "reason": "No sites configured", "site_dead": True}
 
