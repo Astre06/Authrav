@@ -1157,12 +1157,24 @@ class SiteAuthManager:
                     }
 
                 else:
-                    return {
-                        "status": "DECLINED",
-                        "reason": f"Stripe: {stripe_json.get('error', {}).get('message', 'Unknown Stripe error')}",
-                        "source": "stripe",
-                        "stripe": stripe_json
-                    }
+                    # Normalize "not supported" messages from Stripe
+                    stripe_msg = stripe_json.get('error', {}).get('message', 'Unknown Stripe error')
+                    stripe_msg_lower = stripe_msg.lower()
+                    if any(x in stripe_msg_lower for x in ["not supported", "does not support", "unsupported", "is not supported"]):
+                        # "Not supported" should be treated as APPROVED (CVV), not DECLINED
+                        return {
+                            "status": "APPROVED",
+                            "reason": "Your card does not support this type of purchase.",
+                            "source": "stripe",
+                            "stripe": stripe_json
+                        }
+                    else:
+                        return {
+                            "status": "DECLINED",
+                            "reason": f"Stripe: {stripe_msg}",
+                            "source": "stripe",
+                            "stripe": stripe_json
+                        }
 
 
         except Exception as e:

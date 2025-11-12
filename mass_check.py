@@ -1150,6 +1150,11 @@ def _handle_file_impl(bot, message, allowed_users):
                         send_message = False
 
                         msg_lower = message_text.lower()
+                        
+                        # Normalize Stripe "not supported" messages to standard format
+                        if "stripe:" in msg_lower and any(x in msg_lower for x in ["not supported", "does not support", "unsupported", "is not supported"]):
+                            message_text = "Your card does not support this type of purchase."
+                            msg_lower = message_text.lower()
 
                         if any(x in msg_lower for x in ["card number is incorrect", "your card is incorrect", "incorrect number"]):
                             top_status, count_as, send_message = "Declined ❌", "declined", False
@@ -1158,6 +1163,7 @@ def _handle_file_impl(bot, message, allowed_users):
                             top_status, count_as, send_message = "Approved ✅", "cvv", True
                             status = "APPROVED"
                             emoji = "✅"
+                            message_text = "Your card does not support this type of purchase."
 
                         elif any(x in msg_lower for x in ["requires_action", "3ds", "authentication required"]):
                             top_status, count_as, send_message = "3DS", "threed", True
@@ -1331,6 +1337,12 @@ def _handle_file_impl(bot, message, allowed_users):
                         # 🔁 UPDATE PROGRESS BOARD
                         # -----------------------------------------
                         msg_lower = message_text.lower()
+                        
+                        # Normalize Stripe "not supported" messages to standard format
+                        if "stripe:" in msg_lower and any(x in msg_lower for x in ["not supported", "does not support", "unsupported", "is not supported"]):
+                            message_text = "Your card does not support this type of purchase."
+                            msg_lower = message_text.lower()
+                        
                         short_reason = message_text
                         if any(x in msg_lower for x in ["card number is incorrect", "your card is incorrect", "incorrect number"]):
                             short_reason = "Your card number is incorrect"
